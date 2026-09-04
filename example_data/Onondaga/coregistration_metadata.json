@@ -1,0 +1,81 @@
+{
+  "timestamp": "2025-11-11T11:13:30.739313",
+  "output_files": {
+    "registered": "./New Folder (39)/registered.jpg",
+    "nir_band": "./New Folder (39)/NIR_band.png",
+    "five_band": "./New Folder (39)/final_5_band.tiff",
+    "color_preserved": "./New Folder (39)/color_preserved_5_band.tiff",
+    "metadata": "./New Folder (39)/coregistration_metadata.json"
+  },
+  "image_info": {
+    "nir_off": {
+      "path": "./New Folder (39)/20250803-033636-NIR-OFF.jpg",
+      "shape": [
+        1944,
+        2592,
+        3
+      ],
+      "dtype": "uint8",
+      "size_mb": 0.8726987838745117,
+      "channels": 3
+    },
+    "nir_on": {
+      "path": "./New Folder (39)/20250803-033639-NIR-ON.jpg",
+      "shape": [
+        1944,
+        2592,
+        3
+      ],
+      "dtype": "uint8",
+      "size_mb": 0.6918926239013672,
+      "channels": 3
+    },
+    "lwir": {
+      "path": "./New Folder (39)/IMG_0003.pgm",
+      "shape": [
+        120,
+        160
+      ],
+      "dtype": "uint16",
+      "size_mb": 0.07071876525878906,
+      "channels": 1
+    },
+    "output_shape": [
+      972,
+      1296,
+      4
+    ],
+    "registration_transform": [
+      0.8209079552640687,
+      -0.05262085340172,
+      0.25582575552986797,
+      0.5965697475229184,
+      75.1558082881809,
+      -59.012828550852554
+    ]
+  },
+  "processing_parameters": {
+    "max_image_size": 1000,
+    "scale_percent": 50,
+    "registration_metric": "mutual_information",
+    "transform_type": "affine",
+    "thermal_colormap": "2",
+    "invert_thermal": false
+  },
+  "band_descriptions": {
+    "final_5_band.tiff": [
+      "Band 1: Blue Channel (Optical)",
+      "Band 2: Green Channel (Optical)",
+      "Band 3: Red Channel (Optical)",
+      "Band 4: Thermal Data (Normalized 0-255)",
+      "Band 5: NIR Band (NIR-ON minus NIR-OFF)"
+    ],
+    "color_preserved_5_band.tiff": [
+      "Band 1: Red Channel (Optical)",
+      "Band 2: Green Channel (Optical)",
+      "Band 3: Blue Channel (Optical)",
+      "Band 4: Thermal Data (Normalized 0-255)",
+      "Band 5: NIR Band (NIR-ON minus NIR-OFF)"
+    ]
+  }
+}

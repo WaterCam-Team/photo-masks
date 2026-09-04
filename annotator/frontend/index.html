@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>UFONet Water Annotator</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <div class="brand">UFONet · Water Annotator</div>
+  <div class="progress" id="progress">–</div>
+  <button id="btn-train"
+          title="Train the water-detection model on the scenes you've labeled so far">⚙ Train</button>
+  <label class="whoami"
+         title="Your name is recorded with every label you save, so a shared dataset stays attributable. Change it if someone else takes over.">
+    Labeling as
+    <input type="text" id="inp-annotator" maxlength="40" spellcheck="false"
+           placeholder="your name" aria-label="Your name, recorded with each label">
+  </label>
+  <div class="who" id="who"></div>
+</header>
+
+<div id="train-panel" hidden>
+  <div class="tp-head">
+    <b>Fine-tune SegFormer-B0 (5-band)</b>
+    <span id="tp-phase" class="chip pending">idle</span>
+    <span class="spacer"></span>
+    <button id="tp-close" title="Hide this panel. Training keeps running."
+            aria-label="Hide training panel">×</button>
+  </div>
+  <div class="tp-body">
+    <div class="tp-row">
+      <button id="tp-export"
+              title="Collect every scene you have labeled by hand into a training set. Auto masks you never reviewed are excluded.">1 · Export labeled scenes</button>
+      <span id="tp-dataset" class="muted">only scenes a human checked are used</span>
+    </div>
+    <div class="tp-row">
+      <span>2 · </span>
+      <label title="How many times the model sees the whole training set. More = better fit, slower, and eventually overfits.">epochs
+        <input type="number" id="tp-epochs" value="40" min="1" max="500" style="width:64px"
+               aria-label="Training epochs"></label>
+      <label title="Learning rate — how big a step the model takes each update. 0.00006 is a sensible default; change only if training is unstable.">rate
+        <input type="number" id="tp-lr" value="0.00006" step="0.00001" style="width:88px"
+               aria-label="Learning rate"></label>
+      <label title="Image size the model trains at, in pixels. Smaller is faster but loses fine detail.">image size
+        <input type="number" id="tp-size" value="512" step="64" min="128" max="1024" style="width:64px"
+               aria-label="Training image size"></label>
+      <label title="How many photos the model processes at once. Raise this on a GPU; lower it if you run out of memory.">batch
+        <input type="number" id="tp-batch" value="2" min="1" max="16" style="width:52px"
+               aria-label="Batch size"></label>
+      <button id="tp-start" class="primary"
+              title="Start training. This runs in the background — you can keep labeling.">Start training</button>
+      <button id="tp-stop" class="danger" hidden
+              title="Stop training now. The best checkpoint so far is kept.">Stop</button>
+    </div>
+    <div id="tp-live" class="muted" role="status"></div>
+    <div id="tp-evals" class="tp-evals"></div>
+    <div class="tp-row" id="tp-done" hidden>
+      <button id="tp-use" class="accent"
+              title="Add the model you just trained to the auto-segmenter list, so it can pre-label the next scenes for you">3 · Use this model for auto-segmenting</button>
+      <button id="tp-onnx"
+              title="Export the trained model in the format the camera nodes run">Export for deployment</button>
+      <span id="tp-onnx-msg" class="muted"></span>
+    </div>
+    <div id="tp-note" class="muted">
+      CPU training is slow (~1 min/epoch on a small set). It keeps running if you close this panel.
+      A hand-labelled val set gives the only trustworthy mIoU.
+    </div>
+  </div>
+</div>
+
+<main>
+  <aside id="sidebar">
+    <div class="side-head">
+      <span>Scenes</span>
+      <button id="btn-refresh" title="Re-scan the photo folders for new scenes"
+              aria-label="Re-scan for new scenes">⟳</button>
+    </div>
+    <ul id="scene-list"></ul>
+  </aside>
+
+  <section id="workspace">
+    <div class="toolbar">
+      <div class="group">
+        <label title="How the photo is displayed. This only changes what you see — it never changes the mask you paint.">View
+          <select id="sel-layer" aria-label="Photo view">
+            <option value="false" title="Best default: water appears very dark">Colour-IR (water looks dark)</option>
+            <option value="rgb" title="Normal colour photo, as the eye sees it">Normal colour</option>
+            <option value="nir" title="Near-infrared: water absorbs it, so water is dark">Near-infrared</option>
+            <option value="thermal" title="Heat camera — useful at night">Thermal (heat)</option>
+            <option value="ndwi" title="Water index computed from green and near-infrared">Water index (NDWI)</option>
+          </select>
+        </label>
+        <label title="How strongly the blue water mask is drawn over the photo. Drag left to see the photo underneath.">Mask opacity
+          <input type="range" id="rng-opacity" min="0" max="1" step="0.05" value="0.5"
+                 aria-label="Mask overlay opacity">
+        </label>
+        <label title="Magnify the photo. Hold the Space bar and drag to pan around.">Zoom
+          <input type="range" id="rng-zoom" min="0.2" max="6" step="0.1" value="1"
+                 aria-label="Zoom level">
+        </label>
+      </div>
+
+      <div class="group">
+        <label title="Pick which automatic water-finder to use. Hover the Run all results to compare them.">Auto-segment
+          <select id="sel-backend" aria-label="Auto-segmenter"></select>
+        </label>
+        <span id="backend-params" class="params"></span>
+        <button id="btn-run" class="accent"
+                title="Run the selected auto-segmenter and load its result for editing">Run</button>
+        <button id="btn-ensemble"
+                title="Run every available auto-segmenter and compare them side by side">Run all</button>
+        <span id="backend-status" class="muted" role="status"></span>
+      </div>
+
+      <div class="group">
+        <label title="Load a mask that already exists on disk for this scene">Load mask
+          <select id="sel-existing" aria-label="Existing mask on disk"><option value="">—</option></select>
+        </label>
+        <button id="btn-load" title="Load the selected mask into the editor">Load</button>
+      </div>
+
+      <div class="group tools">
+        <button data-tool="brush" class="tool active"
+                title="Paint water onto the photo. Shortcut: B">Brush</button>
+        <button data-tool="erase" class="tool"
+                title="Remove water you painted by mistake. Shortcut: E">Erase</button>
+        <button data-tool="fill"  class="tool"
+                title="Click an area to fill everything of a similar brightness — good for a whole pond at once. Shortcut: F">Fill</button>
+        <label title="Brush and eraser width. Shortcuts: [ smaller, ] larger">Size
+          <input type="range" id="rng-brush" min="2" max="120" step="1" value="24"
+                 aria-label="Brush size"></label>
+        <label title="How similar a pixel must be for Fill to include it. Higher = fills more.">Fill spread
+          <input type="range" id="rng-tol" min="0" max="60" step="1" value="14"
+                 aria-label="Fill tolerance"></label>
+        <button id="btn-clean"
+                title="Tidy the mask: remove speckles, close small gaps, fill interior holes">Clean up</button>
+        <button id="btn-undo" title="Undo the last change. Shortcut: U">Undo</button>
+        <button id="btn-redo" title="Redo. Shortcut: R">Redo</button>
+        <button id="btn-clear" title="Erase the entire mask and start over">Clear all</button>
+      </div>
+    </div>
+
+    <div id="ensemble-panel" hidden>
+      <div class="ens-head">
+        <b>Compare auto-segmenters</b>
+        <button id="ens-votes" class="toggle"
+                title="Shade the photo by how many auto-segmenters called each pixel water. Shows you exactly where they disagree.">
+          Show disagreement map</button>
+        <span id="ens-summary" class="muted"></span>
+        <span class="spacer"></span>
+        <button id="ens-close" title="Hide this panel" aria-label="Hide comparison panel">×</button>
+      </div>
+      <div id="ens-plain" class="muted"></div>
+      <div id="ens-legend" hidden>
+        <span><i class="sw agree"></i>all agree: water</span>
+        <span><i class="sw majority"></i>most say water</span>
+        <span><i class="sw contested"></i>a few say water</span>
+        <span class="legend-note">the stronger the shading, the more evenly split the vote — those are the spots to check</span>
+      </div>
+      <div id="ens-rows"></div>
+      <div class="muted ens-foot">
+        Hover a row to preview that result on the photo · click <b>Use this</b> to load it for editing
+      </div>
+    </div>
+
+    <div id="canvas-wrap">
+      <div id="canvas-pad">
+        <canvas id="bg"></canvas>
+        <canvas id="preview" aria-hidden="true"></canvas>
+        <canvas id="mask"></canvas>
+      </div>
+      <div id="placeholder">Select a scene from the left to start labeling.</div>
+    </div>
+
+    <div class="footer">
+      <div class="stat" title="Share of the photo currently painted as water">Water: <b id="water-pct">–</b></div>
+      <div class="stat" id="decision-hint" role="status"></div>
+      <div class="spacer"></div>
+      <button id="btn-reject" class="danger"
+              title="This scene can't be labeled reliably (blurry, misaligned, or you genuinely can't tell). It is recorded and left out of training.">Reject scene</button>
+      <button id="btn-skip" title="Leave this scene for later without recording anything">Skip</button>
+      <button id="btn-save" class="primary"
+              title="Save this mask as the scene's label and move to the next scene. Shortcut: Enter">Save &amp; Next</button>
+    </div>
+
+    <div class="help">
+      <b>How to label:</b> pick a scene → press <b>Run all</b> and hover the results to
+      compare → <b>Use this</b> on the best one → fix it with the Brush and Eraser →
+      <b>Save &amp; Next</b>. If you can't tell whether it's water, press
+      <b>Reject scene</b> rather than guessing.
+      <br>
+      Keys: <b>B</b> brush · <b>E</b> erase · <b>F</b> fill · <b>[</b>/<b>]</b> size ·
+      <b>U</b> undo · <b>R</b> redo · hold <b>Space</b> to pan · <b>Enter</b> save.
+    </div>
+  </section>
+</main>
+
+<div id="toast"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

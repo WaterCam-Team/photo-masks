@@ -1,0 +1,55 @@
+# UFONet Water Annotator — dependencies
+#
+# The pip equivalent of `uv sync` (see pyproject.toml, which is the source of
+# truth and supports per-group installs). A missing package disables its
+# backend in the UI, with the reason on hover, instead of breaking the app.
+#
+#   pip install -r requirements.txt
+#
+# Python 3.10+ (3.12 recommended; ROCm torch has no 3.14 wheels yet).
+
+# --- core (required) -------------------------------------------------------
+numpy
+rasterio                    # read the 5-band GeoTIFFs
+opencv-contrib-python-headless   # resize / morphology / guided filter.
+                            # MUST be the contrib build: cv2.ximgproc.guidedFilter
+                            # is the spectral backend's default boundary snap and
+                            # is absent from plain opencv-python-headless, where it
+                            # silently degrades to no refinement.
+scipy                       # binary_fill_holes
+Pillow                      # PNG encode/decode
+
+# --- optional: better boundary snapping in the `spectral` backend ----------
+scikit-image                # random-walker refine mode
+
+# --- optional: the `sam` / `sam2` backends --------------------------------
+# Also needs a checkpoint — see README "Which segmentation backends are
+# available". torch comes in as an ultralytics dependency.
+#
+# NOTE (pip only): ultralytics depends on plain `opencv-python`, which installs
+# over the same cv2 directory as the contrib build above and can leave you
+# without cv2.ximgproc. If the spectral backend reports
+# refine: "none (guided needs opencv-contrib-python-headless)", reinstall it
+# last:  pip install --force-reinstall opencv-contrib-python-headless
+# (pyproject.toml/uv handles this automatically with an override.)
+ultralytics
+
+# --- optional: the `segformer` backend + the ⚙ Train panel ----------------
+transformers>=4.40
+torch                       # install the right build for your GPU first:
+                            #   NVIDIA  : default wheels
+                            #   AMD/ROCm: --index-url https://download.pytorch.org/whl/rocm6.2
+                            #   CPU only: --index-url https://download.pytorch.org/whl/cpu
+accelerate
+
+# --- optional: run a .onnx model in the `segformer` backend ---------------
+# Swap for onnxruntime-gpu (CUDA), onnxruntime-rocm (AMD) or
+# onnxruntime-directml (Windows) to use a GPU.
+onnxruntime
+
+# --- optional: "Export for deployment" (ONNX export) ----------------------
+# onnx
+
+# --- optional: the `tinysam` backend --------------------------------------
+# Needs the TinySAM repo + weights as well; see README.
+# timm

@@ -1,0 +1,56 @@
+{
+  "_help": "Copy to annotator_config.json (same dir, or the dir you launch from) and edit. CLI flags override these. Relative 'roots' resolve against the repo root (photo_processing/). Any key may be omitted to keep its default.",
+
+  "roots": ["example_data", "/path/to/your/captures"],
+  "tiff_names": ["color_preserved_5_band.tiff", "final_5_band.tiff"],
+  "exclude_dirs": [".git", ".venv", "venv", "node_modules", "site-packages", "__pycache__"],
+  "max_depth": 6,
+
+  "host": "127.0.0.1",
+  "port": 8000,
+  "annotator": "anon",
+  "work_dir": "work",
+  "device": "auto",
+
+  "_help_device": "auto | cpu | cuda | cuda:0 | mps | xpu (also aliases amd/rocm -> cuda, intel -> xpu). Default for the torch/ultralytics backends (sam, sam2, segformer) and the fine-tune trainer. 'auto' = CUDA/ROCm if present, else Intel xpu, else Apple mps, else cpu. AMD GPUs: install a ROCm build of torch (it still reports as 'cuda'); for the Radeon 780M / gfx1103 also set env HSA_OVERRIDE_GFX_VERSION=11.0.0 (see README 'AMD Radeon 780M'). If a GPU is present but torch can't use it, the startup banner and /api/config device_hint say so and the app stays on CPU. ONNX GPU inference picks up whichever provider your onnxruntime build exposes: onnxruntime-gpu (CUDA), onnxruntime-rocm (AMD), onnxruntime-directml (Windows).",
+
+  "backends": {
+    "spectral": { "enabled": true },
+
+    "nir":     { "enabled": true },
+    "thermal": { "enabled": true },
+
+    "change":  { "enabled": true },
+
+    "sam": {
+      "enabled": true,
+      "weights": null,
+      "model": "fastsam",
+      "allow_download": false
+    },
+
+    "sam2": {
+      "enabled": true,
+      "weights": null,
+      "model": "sam2",
+      "allow_download": false
+    },
+
+    "_help_tinysam": "Fully external: needs a TinySAM checkout AND a driver script, neither of which ships here. Unset, the backend just shows as unavailable.",
+
+    "tinysam": {
+      "enabled": true,
+      "python": null,
+      "tinysam_path": "/path/to/TinySAM",
+      "weights": null,
+      "script": "/path/to/tinysam_water.py"
+    },
+
+    "segformer": {
+      "enabled": true,
+      "onnx": null,
+      "size": null,
+      "water_class": 1
+    }
+  }
+}

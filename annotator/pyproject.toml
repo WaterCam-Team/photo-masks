@@ -1,0 +1,89 @@
+[project]
+name = "ufonet-water-annotator"
+version = "1.0.0"
+description = "Labeling tool + fine-tune loop for 5-band UFONet water segmentation"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "GPL-3.0-or-later" }
+
+# Core: the canvas labeler, mask I/O, and the pure-numpy backends
+# (spectral / nir / thermal / change). These alone give a usable labeler.
+dependencies = [
+    "numpy",
+    "rasterio",              # read the 5-band GeoTIFFs
+    "opencv-contrib-python-headless",  # resize / morphology / guided filter
+                             # contrib, not plain opencv: cv2.ximgproc.guidedFilter
+                             # is what the spectral backend's default boundary snap
+                             # uses, and it lives only in the contrib build.
+    "scipy",                 # binary_fill_holes
+    "pillow",                # PNG encode/decode
+    "scikit-image",          # random-walker boundary refine (spectral backend)
+]
+
+# ---------------------------------------------------------------------------
+# Optional model backends. These are PEP 735 dependency groups rather than
+# extras because this is an application, not a library (`package = false`).
+#
+# `default-groups` below means a plain `uv sync` installs the ones you almost
+# always want — the SAM backends are the recommended default in the UI, so
+# leaving them out ships a deliberately worse tool. Opt out with
+# `uv sync --no-default-groups` for a minimal, torch-free install.
+# ---------------------------------------------------------------------------
+[dependency-groups]
+sam = ["ultralytics"]                                  # `sam` / `sam2` backends (pulls torch)
+train = ["transformers>=4.40", "torch", "accelerate"]  # `segformer` backend + ⚙ Train panel
+onnx = ["onnxruntime"]                                 # run a .onnx in the `segformer` backend
+export = ["onnx"]                                      # "Export for deployment"
+tinysam = ["timm"]                                     # `tinysam` backend (+ TinySAM repo/weights)
+
+[tool.uv]
+package = false
+default-groups = ["sam", "train", "onnx"]
+
+# ultralytics pulls in plain `opencv-python`, which installs into the SAME cv2
+# package directory as our `opencv-contrib-python-headless` — whichever lands
+# last wins, and if it's the plain build then cv2.ximgproc disappears and the
+# spectral backend's guided-filter refinement silently turns into a no-op.
+# Dropping the transitive requirement (an unsatisfiable marker is uv's idiom
+# for this) leaves exactly one cv2 installed: the contrib one, which is a
+# strict superset of what ultralytics needs.
+override-dependencies = ["opencv-python ; sys_platform == 'no-such-platform'"]
+
+# ---------------------------------------------------------------------------
+# Usage
+#
+#   uv sync                        everything you normally want (installs torch)
+#   uv sync --no-default-groups    minimal: labeler + spectral/nir/thermal/change
+#   uv sync --group export         + ONNX export for deployment
+#   uv run server.py --annotator <your-name>
+#
+# torch is a large download (1-3 GB). To pick a specific build, uncomment the
+# matching index block below and re-run `uv sync`:
+#   - CPU only  : much smaller, fine for labeling; training is slow
+#   - AMD ROCm  : also what the Radeon 780M needs; no Python 3.14 wheels yet,
+#                 so pin first with `uv python pin 3.12`
+# ---------------------------------------------------------------------------
+
+# --- CPU only (smallest torch) ---
+# [[tool.uv.index]]
+# name = "pytorch-cpu"
+# url = "https://download.pytorch.org/whl/cpu"
+# explicit = true
+# [tool.uv.sources]
+# torch = { index = "pytorch-cpu" }
+
+# --- NVIDIA CUDA 12.4 ---
+# [[tool.uv.index]]
+# name = "pytorch-cu124"
+# url = "https://download.pytorch.org/whl/cu124"
+# explicit = true
+# [tool.uv.sources]
+# torch = { index = "pytorch-cu124" }
+
+# --- AMD ROCm 6.2 ---
+# [[tool.uv.index]]
+# name = "pytorch-rocm"
+# url = "https://download.pytorch.org/whl/rocm6.2"
+# explicit = true
+# [tool.uv.sources]
+# torch = { index = "pytorch-rocm" }
