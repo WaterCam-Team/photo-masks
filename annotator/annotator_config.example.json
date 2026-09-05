@@ -9,10 +9,14 @@
   "host": "127.0.0.1",
   "port": 8000,
   "annotator": "anon",
+
+  "_help_agreement": "Inter-annotator agreement. replicate_pct is the share of scenes (chosen by a stable hash of the scene id, so the sample never reshuffles) served to replicates_per_scene different people. A replicate scene is served BLIND: anyone who has not labeled it yet gets it with water_mask.png hidden, so the second opinion is independent. Every save also keeps a per-annotator copy in work/masks/<scene-id>/. Score it with photo_processing/agreement.py. 0 disables.",
+  "replicate_pct": 0,
+  "replicates_per_scene": 2,
   "work_dir": "work",
   "device": "auto",
 
-  "_help_device": "auto | cpu | cuda | cuda:0 | mps | xpu (also aliases amd/rocm -> cuda, intel -> xpu). Default for the torch/ultralytics backends (sam, sam2, segformer) and the fine-tune trainer. 'auto' = CUDA/ROCm if present, else Intel xpu, else Apple mps, else cpu. AMD GPUs: install a ROCm build of torch (it still reports as 'cuda'); for the Radeon 780M / gfx1103 also set env HSA_OVERRIDE_GFX_VERSION=11.0.0 (see README 'AMD Radeon 780M'). If a GPU is present but torch can't use it, the startup banner and /api/config device_hint say so and the app stays on CPU. ONNX GPU inference picks up whichever provider your onnxruntime build exposes: onnxruntime-gpu (CUDA), onnxruntime-rocm (AMD), onnxruntime-directml (Windows).",
+  "_help_device": "auto | cpu | cuda | cuda:0 | mps | xpu (also aliases amd/rocm -> cuda, intel -> xpu). Default for the torch/ultralytics backends (sam, sam2, segformer) and the fine-tune trainer. 'auto' = CUDA/ROCm if present, else Intel xpu, else Apple mps, else cpu. AMD GPUs: install a ROCm build of torch (it still reports as 'cuda'); for the Radeon 780M / gfx1103 also set env HSA_OVERRIDE_GFX_VERSION=11.0.0 (see README 'Integrated AMD Radeon'). If a GPU is present but torch can't use it, the startup banner and /api/config device_hint say so and the app stays on CPU. ONNX GPU inference picks up whichever provider your onnxruntime build exposes: onnxruntime-gpu (CUDA), onnxruntime-rocm (AMD), onnxruntime-directml (Windows).",
 
   "backends": {
     "spectral": { "enabled": true },

@@ -75,6 +75,10 @@ DEFAULT_CONFIG = {
     "host": "127.0.0.1",
     "port": 8000,
     "annotator": "anon",
+    # Inter-annotator agreement: a deterministic percentage of scenes is served
+    # to more than one person, blind, so their masks can be compared. 0 = off.
+    "replicate_pct": 0,
+    "replicates_per_scene": 2,
     "work_dir": str(HERE / "work"),
     "device": "auto",              # auto | cpu | cuda | cuda:0 | mps  (torch/ultralytics backends + trainer)
     "backends": {
@@ -254,6 +258,7 @@ def discover_scenes(roots: list[Path], tiff_names: list[str],
 # ===========================================================================
 
 MAX_BODY_BYTES = 64 * 1024 * 1024
+MAX_CLICK_POINTS = 64                            # a prompt this long is a bug, not a workflow
 
 
 def _read5(tiff_path: str) -> np.ndarray:
@@ -524,8 +529,78 @@ class App:
         self.by_id = {s["id"]: s for s in self.scenes}
         self.device = backends_mod.resolve_device(config.get("device", "auto"))
         self.registry = backends_mod.build_registry(config["backends"], device=self.device)
+        # click-to-segment holds a cached SAM2 embedding across requests
+        self.interactive = backends_mod.build_interactive(config["backends"], device=self.device)
         self.trainer = TrainManager(work_dir, device=config.get("device", "auto"))
         self.state = self._load_state()
+        self.replicate_pct = int(config.get("replicate_pct", 0) or 0)
+        self.replicates_per_scene = max(2, int(config.get("replicates_per_scene", 2)))
+        self.labeled_by = self._load_labeled_by()
+
+    # -- inter-annotator agreement ---------------------------------------
+    def _load_labeled_by(self) -> dict[str, set[str]]:
+        """scene_id -> {annotators who have already decided it}, from the log.
+
+        Rebuilt from label_log.csv on boot rather than stored, so it can never
+        disagree with the append-only log that is the actual record.
+        """
+        out: dict[str, set[str]] = {}
+        if not self.log_path.exists():
+            return out
+        try:
+            with self.log_path.open(newline="") as fh:
+                for row in csv.DictReader(fh):
+                    sid = (row.get("scene_id") or "").strip()
+                    who = (row.get("annotator") or "").strip()
+                    if sid and who:
+                        out.setdefault(sid, set()).add(who)
+        except Exception:                             # noqa: BLE001
+            pass
+        return out
+
+    def is_replicate(self, scene_id: str) -> bool:
+        """Deterministic ~replicate_pct sample of scenes to double-label.
+
+        Derived from the scene id alone (same idea as export_dataset.hash_split)
+        so the QA sample stays put as scenes are added, and needs no state.
+        """
+        if self.replicate_pct <= 0:
+            return False
+        h = int(hashlib.sha1(f"replicate:{scene_id}".encode()).hexdigest(), 16)
+        return (h % 100) < self.replicate_pct
+
+    def blind_for(self, scene_id: str, annotator: str) -> bool:
+        """Must this annotator be shown the scene without the existing mask?
+
+        A second opinion is only evidence if it is independent: seeing the first
+        annotator's mask turns agreement measurement into an anchoring test. So
+        on a replicate scene somebody else has already done, water_mask.png is
+        hidden from the list (and from the sidebar's has_manual chip).
+        """
+        if not self.is_replicate(scene_id):
+            return False
+        done = self.labeled_by.get(scene_id, set())
+        return bool(done) and annotator not in done
+
+    def needs_label(self, scene_id: str, annotator: str = "") -> bool:
+        """Is this scene still in *this* annotator's queue?"""
+        done = self.labeled_by.get(scene_id, set())
+        if annotator and annotator in done:
+            return False
+        if self.is_replicate(scene_id) and len(done) < self.replicates_per_scene:
+            return True
+        if done:
+            return False
+        return self.state.get(scene_id, {}).get("review_status", "pending") == "pending"
+
+    def annotator_mask_path(self, scene_id: str, annotator: str) -> Path:
+        d = self.work_dir / "masks" / scene_id
+        d.mkdir(parents=True, exist_ok=True)
+        return d / f"{_slug(annotator) or 'anon'}.png"
+
+    def record_decision(self, scene_id: str, annotator: str) -> None:
+        if annotator:
+            self.labeled_by.setdefault(scene_id, set()).add(annotator)
 
     def scenes_per_root(self) -> dict:
         counts = {str(r): 0 for r in self.roots}
@@ -593,17 +668,29 @@ class App:
             w.writerows(rows.values())
 
     # -- scene list ------------------------------------------------------
-    def scene_list(self) -> list[dict]:
+    def scene_list(self, annotator: str = "") -> list[dict]:
+        """The queue as *this* annotator sees it.
+
+        review_status is per-annotator: a replicate scene someone else has
+        labeled still reads 'pending' for everyone who owes it a second
+        opinion, and its has_manual chip is suppressed so the sidebar doesn't
+        leak that a mask already exists.
+        """
         out = []
         for s in self.scenes:
-            st = self.state.get(s["id"], {})
+            sid = s["id"]
+            st = self.state.get(sid, {})
+            done = self.labeled_by.get(sid, set())
+            blind = self.blind_for(sid, annotator)
             out.append({
-                "id": s["id"], "name": s["name"],
-                "review_status": st.get("review_status", "pending"),
-                "water_pct": st.get("final_water_pct"),
-                "route": st.get("route"),
+                "id": sid, "name": s["name"],
+                "review_status": ("pending" if self.needs_label(sid, annotator)
+                                  else st.get("review_status", "pending")),
+                "water_pct": None if blind else st.get("final_water_pct"),
+                "route": None if blind else st.get("route"),
                 "updated": st.get("updated"),
-                "has_manual": (Path(s["dir"]) / "water_mask.png").exists(),
+                "has_manual": (not blind) and (Path(s["dir"]) / "water_mask.png").exists(),
+                "n_labels": len(done),
             })
         return out
 
@@ -731,10 +818,14 @@ class Handler(BaseHTTPRequestHandler):
                 "tiff_names": app.config["tiff_names"],
                 "device": backends_mod.device_label(app.config.get("device", "auto")),
                 "device_hint": backends_mod.accel_hint(),
+                "interactive": app.interactive.info(),
+                "replicate_pct": app.replicate_pct,
+                "replicates_per_scene": app.replicates_per_scene,
             })
 
         if p == "/api/scenes":
-            return self._json({"scenes": app.scene_list()})
+            who = clean_annotator(q.get("annotator", [""])[0], "")
+            return self._json({"scenes": app.scene_list(who)})
 
         if p == "/api/train/status":
             return self._json(app.trainer.status())
@@ -782,18 +873,24 @@ class Handler(BaseHTTPRequestHandler):
             scene = app.by_id.get(m.group(1))
             if not scene:
                 return self._err(404, "no such scene")
+            who = clean_annotator(q.get("annotator", [""])[0], "")
+            blind = app.blind_for(scene["id"], who)
             hw = list(_tiff_hw(scene["tiff"]))
             existing = [{"name": n, "label": lbl}
                         for n, lbl in EXISTING_MASKS
-                        if (Path(scene["dir"]) / n).exists()]
+                        if (Path(scene["dir"]) / n).exists()
+                        # independent second opinion: don't hand them the answer
+                        and not (blind and n == "water_mask.png")]
             for f in sorted(app.cache_dir(scene["id"]).glob("_annotator_auto_*.png")):
                 existing.append({"name": f.name,
                                  "label": f"last {f.stem.replace('_annotator_auto_', '')}"})
             st = app.state.get(scene["id"], {})
             return self._json({
                 "id": scene["id"], "name": scene["name"], "size": hw,
-                "review_status": st.get("review_status", "pending"),
+                "review_status": ("pending" if app.needs_label(scene["id"], who)
+                                  else st.get("review_status", "pending")),
                 "existing_masks": existing,
+                "blind": blind,
             })
 
         return self._err(404, "not found")
@@ -846,6 +943,24 @@ class Handler(BaseHTTPRequestHandler):
                 return self._err(404, "no such scene")
             return self._handle_save(scene, self._body_json())
 
+        m = re.match(r"^/api/scene/([^/]+)/click/prepare$", p)
+        if m:
+            scene = app.by_id.get(m.group(1))
+            if not scene:
+                return self._err(404, "no such scene")
+            return self._handle_click_prepare(scene, self._body_json())
+
+        m = re.match(r"^/api/scene/([^/]+)/click$", p)
+        if m:
+            scene = app.by_id.get(m.group(1))
+            if not scene:
+                return self._err(404, "no such scene")
+            return self._handle_click(scene, self._body_json())
+
+        if p == "/api/click/release":
+            app.interactive.release()
+            return self._json({"ok": True})
+
         m = re.match(r"^/api/scene/([^/]+)/review$", p)
         if m:
             scene = app.by_id.get(m.group(1))
@@ -872,6 +987,118 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(app.trainer.export_onnx(HERE / "weights" / "segformer_5band.onnx"))
 
         return self._err(404, "not found")
+
+    # -- click-to-segment (SAM2) --------------------------------
+    # prepare = encode the scene once (~15-20 s CPU); click = decode against
+    # the cached embedding (~70-150 ms). The client calls prepare when the tool
+    # is selected, then clicks freely.
+
+    @staticmethod
+    def _click_on(data: dict) -> str:
+        on = data.get("on", "rgb")
+        if on not in ("rgb", "false"):
+            raise ValueError("on must be 'rgb' or 'false'")
+        return on
+
+    def _click_image(self, scene: dict, on: str) -> np.ndarray:
+        return backends_mod.sam_prompt_image(_read5(scene["tiff"]), on)
+
+    @staticmethod
+    def _parse_points(data: dict, hw: tuple[int, int]) -> tuple[list, list]:
+        """Client points are full-resolution image pixels; validate and clamp."""
+        H, W = hw
+        raw = data.get("points") or []
+        labs = data.get("labels") or []
+        if not isinstance(raw, list) or len(raw) > MAX_CLICK_POINTS:
+            raise ValueError(f"points must be a list of at most {MAX_CLICK_POINTS} [x, y] pairs")
+        pts, out = [], []
+        for i, pt in enumerate(raw):
+            if not (isinstance(pt, (list, tuple)) and len(pt) == 2):
+                raise ValueError("each point must be [x, y]")
+            x, y = int(pt[0]), int(pt[1])
+            if not (0 <= x < W and 0 <= y < H):
+                raise ValueError(f"point {i} is outside the image")
+            pts.append([x, y])
+            out.append(1 if i >= len(labs) or int(labs[i]) else 0)
+        return pts, out
+
+    @staticmethod
+    def _parse_box(box, hw: tuple[int, int]) -> list | None:
+        if not box:
+            return None
+        H, W = hw
+        if not (isinstance(box, (list, tuple)) and len(box) == 4):
+            raise ValueError("box must be [x0, y0, x1, y1]")
+        x0, y0, x1, y1 = (int(v) for v in box)
+        x0, x1 = sorted((max(0, x0), min(W - 1, x1)))
+        y0, y1 = sorted((max(0, y0), min(H - 1, y1)))
+        if x1 - x0 < 2 or y1 - y0 < 2:
+            raise ValueError("box is too small")
+        return [x0, y0, x1, y1]
+
+    def _handle_click_prepare(self, scene: dict, data: dict):
+        app = self.app
+        ok, why = app.interactive.available()
+        if not ok:
+            return self._err(400, why)
+        on = self._click_on(data)
+        key = (scene["id"], on)
+        if app.interactive.ready(key):
+            return self._json({"ok": True, "cached": True, "elapsed_s": 0.0})
+        res = app.interactive.prepare(key, self._click_image(scene, on))
+        if not res.get("ok"):
+            return self._err(500, res.get("error", "encode failed"))
+        return self._json(res)
+
+    def _handle_click(self, scene: dict, data: dict):
+        app = self.app
+        ok, why = app.interactive.available()
+        if not ok:
+            return self._err(400, why)
+        on = self._click_on(data)
+        hw = _tiff_hw(scene["tiff"])
+        pts, labels = self._parse_points(data, hw)
+        box = self._parse_box(data.get("box"), hw)
+        if not pts and not box:
+            return self._err(400, "give at least one point or a box")
+
+        key = (scene["id"], on)
+        if not app.interactive.ready(key):        # first click, or scene/view changed
+            res = app.interactive.prepare(key, self._click_image(scene, on))
+            if not res.get("ok"):
+                return self._err(500, res.get("error", "encode failed"))
+
+        # A single point is ambiguous (part / sub-part / whole), so let SAM2
+        # return its three candidates for the user to cycle. Once there are
+        # several points or a box, the prompt is specific enough for one mask.
+        multimask = bool(data.get("multimask", True)) and len(pts) <= 1 and box is None
+
+        t0 = time.time()
+        masks, scores, err = app.interactive.predict(key, pts, labels, box, multimask)
+        if err:
+            return self._err(500, err)
+
+        import cv2
+        from PIL import Image
+        cdir = app.cache_dir(scene["id"])
+        order = sorted(range(len(masks)),
+                       key=lambda i: -(scores[i] if i < len(scores) else 0.0))
+        ts = int(time.time() * 1000)
+        cands = []
+        for rank, i in enumerate(order):
+            m = masks[i].astype(np.uint8) * 255
+            if m.shape != hw:
+                m = cv2.resize(m, (hw[1], hw[0]), interpolation=cv2.INTER_NEAREST)
+            name = f"_annotator_click_{rank}.png"
+            Image.fromarray(m, "L").save(cdir / name, "PNG")
+            cands.append({
+                "url": f"/api/scene/{scene['id']}/maskfile?name={name}&t={ts}",
+                "water_pct": round(100 * float((m > 127).mean()), 2),
+                "score": scores[i] if i < len(scores) else None,
+            })
+        return self._json({"ok": True, "elapsed_s": round(time.time() - t0, 3),
+                           "candidates": cands, "n_points": len(pts),
+                           "model": app.interactive.info().get("model")})
 
     # -- ensemble (run all backends, measure agreement) ----------
     def _handle_ensemble(self, scene: dict, data: dict):
@@ -1003,6 +1230,11 @@ class Handler(BaseHTTPRequestHandler):
         with app.lock:
             from PIL import Image
             Image.fromarray(final, "L").save(Path(scene["dir"]) / "water_mask.png", "PNG")
+            # water_mask.png is whoever saved last; this per-annotator copy is
+            # what makes inter-annotator agreement measurable at all. It lives
+            # in work/, so the scene directory still only ever gets one file.
+            per_mask = app.annotator_mask_path(scene["id"], who)
+            Image.fromarray(final, "L").save(per_mask, "PNG")
             feats = app.features(scene)
             rlf.append_log(app.log_path, {
                 "timestamp": datetime.now().isoformat(timespec="seconds"),
@@ -1023,6 +1255,8 @@ class Handler(BaseHTTPRequestHandler):
                 "ensemble_disagreement_frac": sess.get("ensemble_disagreement_frac", ""),
                 "n_backends_run": sess.get("n_backends_run", ""),
                 "features_json": json.dumps(feats),
+                "n_clicks": int(sess.get("n_clicks", 0) or 0),
+                "mask_path": str(per_mask),
             })
             app.state[scene["id"]] = {
                 "review_status": "approved", "route": route,
@@ -1030,13 +1264,14 @@ class Handler(BaseHTTPRequestHandler):
                 "updated": datetime.now().strftime("%Y%m%d-%H%M%S"),
             }
             app._save_state()
+            app.record_decision(scene["id"], who)
             app.sync_manifest(scene, "approved", "water_mask.png", final_pct)
 
         return self._json({
             "ok": True, "route": route, "annotator": who,
             "auto_vs_final_iou": iou, "edited_pixel_frac": edited,
             "final_water_pct": final_pct,
-            "next": self._next_scene_id(scene["id"]),
+            "next": self._next_scene_id(scene["id"], who),
         })
 
     # -- review (reject / skip) ---------------------------------
@@ -1046,13 +1281,15 @@ class Handler(BaseHTTPRequestHandler):
         if status not in ("rejected", "skip"):
             return self._err(400, "status must be 'rejected' or 'skip'")
 
+        sess = data.get("session", {})
+        who = clean_annotator(sess.get("annotator"), app.annotator)
+
         if status == "rejected":
-            sess = data.get("session", {})
             with app.lock:
                 feats = app.features(scene)
                 rlf.append_log(app.log_path, {
                     "timestamp": datetime.now().isoformat(timespec="seconds"),
-                    "annotator": clean_annotator(sess.get("annotator"), app.annotator),
+                    "annotator": who,
                     "scene_id": scene["id"], "scene_dir": scene["dir"],
                     "route": "rejected",
                     "seed_backend": sess.get("seed_backend", "") or "",
@@ -1071,11 +1308,13 @@ class Handler(BaseHTTPRequestHandler):
                     "updated": datetime.now().strftime("%Y%m%d-%H%M%S"),
                 }
                 app._save_state()
+                app.record_decision(scene["id"], who)
                 app.sync_manifest(scene, "rejected", "", 0.0)
 
-        return self._json({"ok": True, "next": self._next_scene_id(scene["id"])})
+        return self._json({"ok": True, "next": self._next_scene_id(scene["id"], who)})
 
-    def _next_scene_id(self, current: str) -> str | None:
+    def _next_scene_id(self, current: str, annotator: str = "") -> str | None:
+        """Next scene *this* annotator still owes a decision on."""
         ids = [s["id"] for s in self.app.scenes]
         try:
             start = ids.index(current)
@@ -1084,7 +1323,7 @@ class Handler(BaseHTTPRequestHandler):
         for sid in ids[start + 1:] + ids[:start + 1]:
             if sid == current:
                 continue
-            if self.app.state.get(sid, {}).get("review_status", "pending") == "pending":
+            if self.app.needs_label(sid, annotator):
                 return sid
         return None
 
@@ -1186,6 +1425,12 @@ def main():
                 if n not in app.registry]
     if disabled:
         print(f"  backends off by config: {', '.join(disabled)}")
+    _iok, _iwhy = app.interactive.available()
+    print(f"  click-to-segment  {'ok' if _iok else 'DISABLED: ' + _iwhy}")
+    if app.replicate_pct > 0:
+        n_rep = sum(1 for s in app.scenes if app.is_replicate(s["id"]))
+        print(f"  agreement sample: {app.replicate_pct}% "
+              f"({n_rep} scene(s)) labeled by {app.replicates_per_scene} people, blind")
     if Handler.allowed_hosts is None:
         print("\n  ! bound to a wildcard address — there is NO authentication and "
               "no Host pinning.\n    Anyone who can reach this port can read your "

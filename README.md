@@ -34,9 +34,10 @@ water from snow, which is why a human stays in the loop.
 | stage | what it does |
 |---|---|
 | **`pipeline.py`** | Batch: scan a captures root, run a CPU auto-labeler on every 5-band TIFF, write `water_mask_auto.png` per scene and a `manifest.csv` |
-| **`annotator/`** | Local web app: paint masks by hand, or seed from any of 8 auto-segmentation backends, compare them, correct, and save. Writes `water_mask.png` and logs every decision. **Start here** — see [`annotator/README.md`](annotator/README.md) |
+| **`annotator/`** | Local web app: paint masks by hand, **click on the water and let SAM2 outline it**, or seed from any of 8 auto-segmentation backends, compare them, correct, and save. Writes `water_mask.png` and logs every decision. **Start here** — see [`annotator/README.md`](annotator/README.md) |
 | **`review.py`** | Minimal terminal alternative to the annotator: approve / reject / flag the batch masks one at a time |
 | **`export_dataset.py`** | Emit `img_dir/` + `ann_dir/` in MMSeg format. `--gold-only` exports *only* human-verified masks and writes `dataset_provenance.csv` |
+| **`agreement.py`** | Score how much two labelers agree on the same scenes (IoU, Cohen's κ, boundary F1) — the noise ceiling your model mIoU should be read against |
 
 ## Quick start
 
@@ -76,6 +77,14 @@ unverified auto mask. `dataset_provenance.csv` records, per scene, which route
 it came from, which backend seeded it, how much the human changed, and how long
 it took.
 
+With more than one labeler, turn on the agreement sample (`replicate_pct` in
+the annotator's config). A deterministic slice of scenes is then served to a
+second person **blind**, every annotator's mask is kept, and `agreement.py`
+scores how much they actually agree. Those double-labeled scenes are routed to
+validation rather than training, because they are the only ones whose human
+noise floor is known — a model scoring above it is fitting label noise. See
+**Measuring agreement between labelers** in the annotator README.
+
 ## Requirements
 
 Python 3.10+. Core dependencies are numpy, rasterio,
@@ -92,10 +101,11 @@ AMD / Intel / Apple, are in [`annotator/README.md`](annotator/README.md).
 pipeline.py              batch auto-labeling -> manifest.csv
 review.py                terminal review loop over manifest.csv
 export_dataset.py        MMSeg export, incl. --gold-only + provenance
-example_data/            three real co-registered scenes, enough to try everything
+agreement.py             inter-annotator agreement over the annotator's masks
+example_data/            two real co-registered scenes, enough to try everything
 annotator/               the labeling web app (see its own README)
   server.py                stdlib HTTP server: config, discovery, rendering, save/ensemble/train
-  backends.py              8 auto-segmentation adapters behind one interface
+  backends.py              8 auto-seg adapters + InteractiveSam (SAM2 click-to-segment)
   autolabel.py             spectral fusion engine + SAM prompt derivation (no torch)
   trainer.py               5-band SegFormer fine-tune + ONNX export
   rl_features.py           scene features, mask IoU, decision-log writer

@@ -128,12 +128,28 @@
                 title="Remove water you painted by mistake. Shortcut: E">Erase</button>
         <button data-tool="fill"  class="tool"
                 title="Click an area to fill everything of a similar brightness — good for a whole pond at once. Shortcut: F">Fill</button>
+        <button data-tool="click" class="tool"
+                title="Click on the water and SAM2 outlines it. Left click = this is water, Shift/right click = this is not. Shortcut: K">Click (SAM2)</button>
         <label title="Brush and eraser width. Shortcuts: [ smaller, ] larger">Size
           <input type="range" id="rng-brush" min="2" max="120" step="1" value="24"
                  aria-label="Brush size"></label>
         <label title="How similar a pixel must be for Fill to include it. Higher = fills more.">Fill spread
           <input type="range" id="rng-tol" min="0" max="60" step="1" value="14"
                  aria-label="Fill tolerance"></label>
+        <span id="click-group" hidden
+              title="SAM2 click-to-segment: left click the water, Shift or right click anything wrongly included.">
+          <label title="Which rendering SAM2 looks at. Changing it re-encodes the scene.">on
+            <select id="sel-click-on" aria-label="Image SAM2 segments on">
+              <option value="rgb">normal colour</option>
+              <option value="false">colour-IR</option>
+            </select>
+          </label>
+          <button id="btn-click-undo" disabled
+                  title="Remove the last point you placed">Undo point</button>
+          <button id="btn-click-new" disabled
+                  title="Keep this outline and start clicking a separate body of water. Shortcut: N">New object</button>
+          <span id="click-status" class="muted" role="status"></span>
+        </span>
         <button id="btn-clean"
                 title="Tidy the mask: remove speckles, close small gaps, fill interior holes">Clean up</button>
         <button id="btn-undo" title="Undo the last change. Shortcut: U">Undo</button>
@@ -170,6 +186,13 @@
         <canvas id="bg"></canvas>
         <canvas id="preview" aria-hidden="true"></canvas>
         <canvas id="mask"></canvas>
+        <!-- SAM2 is working: a ring where you clicked, and a covering
+             overlay for the one-off scene encode. Both are inert. -->
+        <div id="sam-pending" hidden aria-hidden="true"></div>
+        <div id="sam-overlay" hidden aria-hidden="true">
+          <div class="sam-spin"></div>
+          <div id="sam-overlay-msg" class="sam-msg"></div>
+        </div>
       </div>
       <div id="placeholder">Select a scene from the left to start labeling.</div>
     </div>

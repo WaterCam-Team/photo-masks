@@ -123,10 +123,73 @@ def _read_bands(tiff_path: Path) -> np.ndarray:
     return arr
 
 
+def _minmax_per_image(bands: np.ndarray) -> np.ndarray:
+    """Legacy preprocessing: per-band min-max to [0,1], measured per image.
+
+    Kept only for checkpoints trained before band statistics existed. It
+    erases absolute radiometry (water's low NIR reflectance is exactly that
+    signature), which is why trained models now carry a norm.json instead —
+    see training/stats.py.
+    """
+    out = np.asarray(bands, np.float32).copy()
+    for i in range(out.shape[0]):
+        lo, hi = float(out[i].min()), float(out[i].max())
+        out[i] = (out[i] - lo) / (hi - lo) if hi > lo else 0.0
+    return np.clip(out, 0.0, 1.0)
+
+
 def _tiff_size(tiff_path: Path) -> tuple[int, int]:
     import rasterio
     with rasterio.open(tiff_path) as src:
         return src.height, src.width
+
+
+SAM_DEFAULT_WEIGHTS = {"fastsam": "FastSAM-s.pt", "sam": "sam_b.pt", "sam2": "sam2.1_l.pt"}
+
+
+def resolve_sam_weights(weights_cfg: str | None, allow_download: bool = False,
+                        model_type: str = "fastsam") -> tuple[str | None, str]:
+    """Locate a SAM/SAM2/FastSAM checkpoint. Returns (path_or_name, model_type).
+
+    A relative path is tried as given, then against the cwd, then against the
+    repo root. The checkpoint's filename also settles `model_type`, so pointing
+    `sam.weights` at a sam2 file does the right thing instead of loading it
+    with the wrong class.
+    """
+    if weights_cfg:
+        cand = Path(os.path.expanduser(str(weights_cfg)))
+        tries = [cand, Path.cwd() / cand, REPO_ROOT / cand] if not cand.is_absolute() else [cand]
+        wp = next((t.resolve() for t in tries if t.exists()), None)
+        if wp is not None:
+            n = wp.name.lower()
+            if "sam2" in n:
+                model_type = "sam2"
+            elif "fastsam" in n:
+                model_type = "fastsam"
+            elif n.startswith("sam"):
+                model_type = "sam"
+            return str(wp), model_type
+    if allow_download:
+        return (weights_cfg or SAM_DEFAULT_WEIGHTS.get(model_type, "FastSAM-s.pt")), model_type
+    return None, model_type
+
+
+def sam_prompt_image(arr: np.ndarray, on: str = "rgb") -> np.ndarray:
+    """The 3-channel image handed to SAM, in **BGR** order.
+
+    ultralytics documents numpy inputs as OpenCV-order BGR and its preprocess
+    does `im[..., ::-1]` to recover RGB, so handing it an RGB array silently
+    swaps red and blue before the model ever sees it.
+
+    on="rgb"   -> true colour
+    on="false" -> colour-IR (NIR->R, R->G, G->B), where water is very dark
+    """
+    if on == "false":
+        def st(x):
+            lo, hi = np.percentile(x, [2, 98])
+            return np.clip((x - lo) / (hi - lo + 1e-6) * 255, 0, 255).astype(np.uint8)
+        return np.dstack([st(arr[B_G]), st(arr[B_R]), st(arr[B_NIR])])      # B, G, R
+    return np.dstack([arr[B_B], arr[B_G], arr[B_R]]).clip(0, 255).astype(np.uint8)
 
 
 def _clean(mask_bool: np.ndarray, open_iter: int = 2, close_iter: int = 1,
@@ -363,8 +426,13 @@ class TinySamBackend(Backend):
 
 # ---------------------------------------------------------------------------
 # 4. SegFormer  in-process, from a .onnx (onnxruntime) or an HF checkpoint dir.
-#    Preprocessing is per-band resize + min-max to [0, 1]; trainer.py's
-#    load_tiff() does exactly the same, and the two must not drift apart.
+#    Preprocessing is dictated by the model, not by this file: a checkpoint
+#    trained by the `training/` package ships a `norm.json` naming its modality
+#    (which bands it consumes) and the band statistics it was normalised with.
+#    This backend reads that file and applies exactly those, which is what
+#    keeps training and inference from drifting apart. A model with no
+#    norm.json is treated as legacy 5-band per-image min-max, the behaviour
+#    every checkpoint had before the statistics were introduced.
 # ---------------------------------------------------------------------------
 
 
@@ -382,6 +450,7 @@ class SegformerOnnxBackend(Backend):
         self.device = resolve_device(device)
         self._sess = None                            # onnxruntime session
         self._torch = None                           # HF model (moved to self.device)
+        self._pre = None                             # resolved preprocessing, cached
         self._lock = threading.Lock()                # serialise inference across request threads
         self._is_hf = bool(self.model_path
                            and Path(self.model_path).is_dir()
@@ -424,7 +493,20 @@ class SegformerOnnxBackend(Backend):
                            "(or `uv sync --group onnx`)")
         return True, ""
 
-    def _size_hw(self) -> tuple[int, int]:
+    def _size_hw(self, native_hw: tuple[int, int] | None = None,
+                 pre: dict | None = None) -> tuple[int, int]:
+        """Input size, matched to how the model was trained.
+
+        A checkpoint from the `training/` package was validated on whole frames
+        at native resolution (its training crops came from scale-jittered but
+        never aspect-squashed frames), so it is served the same way: native,
+        padded up to a multiple of 32. Squashing a 4:3 frame into 512x512 would
+        stretch every shoreline by a third relative to what it learned.
+
+        Legacy checkpoints stay on 512x512 because that is the geometry they
+        were trained with, and a .onnx graph keeps whatever size it was
+        exported at. `backends.segformer.size` overrides either way.
+        """
         if self.size:
             return self.size
         if not self._is_hf:
@@ -432,6 +514,9 @@ class SegformerOnnxBackend(Backend):
             h = shp[2] if isinstance(shp[2], int) else 512
             w = shp[3] if isinstance(shp[3], int) else 512
             return h, w
+        if native_hw and pre is not None and not pre["legacy"]:
+            h, w = native_hw
+            return h + (-h) % 32, w + (-w) % 32
         return 512, 512
 
     # ONNX Runtime GPU execution providers, in preference order. Picked up
@@ -479,6 +564,58 @@ class SegformerOnnxBackend(Backend):
         out = np.asarray(sess.run(None, {sess.get_inputs()[0].name: x})[0])
         return out[0] if out.ndim == 4 else out
 
+    def _norm_json(self) -> Path | None:
+        """Where a checkpoint's band statistics live, if it has any."""
+        p = Path(self.model_path)
+        cands = [p / "norm.json"] if p.is_dir() else \
+            [p.with_suffix(""), p.parent / (p.stem + ".norm.json")]
+        for c in cands:
+            c = c if c.name.endswith("norm.json") else c.parent / (c.name + ".norm.json")
+            if c.exists():
+                return c
+        return None
+
+    def _preprocessing(self) -> dict:
+        """Resolve {bands, norm, read} from the model's norm.json, once.
+
+        Falls back to legacy 5-band per-image min-max when there is no
+        norm.json, so checkpoints predating the statistics keep working
+        unchanged. `meta["norm"]` reports which path was taken, because a
+        silent switch between the two would be an accuracy bug nobody sees.
+        """
+        if self._pre is not None:
+            return self._pre
+        legacy = {"bands": (0, 1, 2, 3, 4), "read": None, "modality": "fiveband",
+                  "label": "legacy per-image min-max", "norm": _minmax_per_image,
+                  "legacy": True}
+        nj = self._norm_json()
+        if nj is None:
+            self._pre = legacy
+            return self._pre
+        try:
+            import sys
+            if str(ANN_DIR.parent) not in sys.path:
+                sys.path.insert(0, str(ANN_DIR.parent))
+            from training import modalities as _M
+            from training.stats import BandStats, Normalizer
+
+            st = BandStats.from_json(nj)
+            m = _M.get(st.modality)
+            if m.channels != st.channels:
+                raise ValueError(f"norm.json says {st.channels} channels but modality "
+                                 f"{st.modality!r} has {m.channels}")
+            norm = Normalizer(st)
+            read = None
+            if m.extra_glob:                         # e.g. rgb_nofilt's NIR-ON frame
+                def read(scene_dir, tiff_path, _m=m):
+                    return _M.read_modality(_m, tiff_path, scene_dir)
+            self._pre = {"bands": tuple(m.bands), "read": read, "modality": st.modality,
+                         "label": f"{st.modality}/{norm.method} from {nj.name}",
+                         "norm": norm, "legacy": False}
+        except Exception as e:                        # noqa: BLE001 - never break inference
+            self._pre = dict(legacy, label=f"legacy min-max ({nj.name} unusable: {e})")
+        return self._pre
+
     def run(self, scene_dir, tiff_path, params):
         with self._lock:                             # one forward() at a time
             return self._run(scene_dir, tiff_path, params)
@@ -491,24 +628,26 @@ class SegformerOnnxBackend(Backend):
         except Exception as e:                        # noqa: BLE001
             return BackendResult(None, error=str(e))
         H0, W0 = arr.shape[1], arr.shape[2]
-        H, W = self._size_hw()
+        pre = self._preprocessing()
+        H, W = self._size_hw((H0, W0), pre)
 
-        bands = arr[:5].copy()
+        if pre["read"] is not None:                  # modality needs a sibling file
+            bands = pre["read"](Path(scene_dir), Path(tiff_path)).astype(np.float32)
+        else:
+            bands = arr[list(pre["bands"])].copy()
         if bands.shape[1:] != (H, W):
             bands = np.stack(
                 [cv2.resize(bands[i], (W, H), interpolation=cv2.INTER_AREA)
-                 for i in range(5)], axis=0)
-        for i in range(5):
-            lo, hi = float(bands[i].min()), float(bands[i].max())
-            bands[i] = (bands[i] - lo) / (hi - lo) if hi > lo else 0.0
-        x = np.clip(bands, 0.0, 1.0)[None].astype(np.float32)
+                 for i in range(bands.shape[0])], axis=0)
+        x = pre["norm"](bands)[None].astype(np.float32)
 
         try:
             out = np.asarray(self._predict(x))
         except Exception as e:                        # noqa: BLE001
             return BackendResult(None, error=f"SegFormer inference failed: {e}")
 
-        meta: dict = {}
+        meta: dict = {"preprocessing": pre["label"], "modality": pre["modality"],
+                      "input_hw": [int(H), int(W)]}
         if out.ndim == 3:                            # (C, h, w) logits
             ex = np.exp(out - out.max(axis=0, keepdims=True))
             p = ex / ex.sum(axis=0, keepdims=True)
@@ -580,7 +719,7 @@ class SamPromptedBackend(Backend):
         {"name": "use_box", "type": "bool", "default": True,
          "help": "Also pass the prior's bounding box as a prompt."},
     ]
-    _DEFAULT_NAME = {"fastsam": "FastSAM-s.pt", "sam": "sam_b.pt", "sam2": "sam2.1_l.pt"}
+    _DEFAULT_NAME = SAM_DEFAULT_WEIGHTS
 
     def __init__(self, weights: str | None = None, model_type: str = "fastsam",
                  allow_download: bool = False, name: str | None = None,
@@ -599,23 +738,8 @@ class SamPromptedBackend(Backend):
         self._resolve()
 
     def _resolve(self):
-        if self._weights_cfg:
-            cand = Path(os.path.expanduser(str(self._weights_cfg)))
-            tries = [cand, Path.cwd() / cand, REPO_ROOT / cand] if not cand.is_absolute() else [cand]
-            wp = next((t.resolve() for t in tries if t.exists()), None)
-            if wp is not None:
-                self._resolved = str(wp)
-                n = wp.name.lower()
-                if "sam2" in n:
-                    self.model_type = "sam2"
-                elif "fastsam" in n:
-                    self.model_type = "fastsam"
-                elif n.startswith("sam"):
-                    self.model_type = "sam"
-                return
-        if self.allow_download:
-            self._resolved = (self._weights_cfg
-                              or self._DEFAULT_NAME.get(self.model_type, "FastSAM-s.pt"))
+        self._resolved, self.model_type = resolve_sam_weights(
+            self._weights_cfg, self.allow_download, self.model_type)
 
     def available(self):
         try:
@@ -651,14 +775,7 @@ class SamPromptedBackend(Backend):
             return BackendResult(None, error=str(e))
         H, W = arr.shape[1], arr.shape[2]
 
-        r, g, b, nir = arr[B_R], arr[B_G], arr[B_B], arr[B_NIR]
-        if p["on"] == "false":
-            def st(x):
-                lo, hi = np.percentile(x, [2, 98])
-                return np.clip((x - lo) / (hi - lo + 1e-6) * 255, 0, 255).astype(np.uint8)
-            img = np.dstack([st(nir), st(r), st(g)])
-        else:
-            img = np.dstack([r, g, b]).clip(0, 255).astype(np.uint8)
+        img = sam_prompt_image(arr, p["on"])
 
         _m, prior_meta, prob = autolabel.spectral_water(arr, {"refine": "none"})
         pr = autolabel.derive_prompts(arr, prob, int(p["n_pos"]), int(p["n_neg"]))
@@ -725,6 +842,150 @@ class SamPromptedBackend(Backend):
             "water_pct": round(100 * float((mask > 0).mean()), 2),
         }
         return BackendResult(mask, time.time() - t0, meta)
+
+
+# ---------------------------------------------------------------------------
+# Interactive click-to-segment (SAM2)
+#
+# NOT a Backend: backends map a scene to a mask in one shot, this one holds
+# conversational state across many requests.
+#
+# The whole design follows from one measurement: encoding a 1296x972 scene with
+# SAM2.1-L costs ~20 s on CPU, while decoding a click against a cached
+# embedding costs ~60-150 ms. ultralytics exposes exactly that split —
+# `set_image()` stores `predictor.features`, and `prompt_inference()` reuses
+# them instead of re-encoding. So the encoder runs once per (scene, view) and
+# every click after it is interactive.
+#
+# Only the promptable SAM/SAM2 predictors work this way. FastSAM is a YOLO-seg
+# model whose "prompting" is post-hoc selection among masks it already
+# produced; there is no embedding to cache, so it is rejected here.
+# ---------------------------------------------------------------------------
+
+class InteractiveSam:
+    """One cached SAM2 image embedding + fast prompt decoding."""
+
+    def __init__(self, weights: str | None = None, model_type: str = "sam2",
+                 allow_download: bool = False, device: str | None = "auto"):
+        self.device = resolve_device(device)
+        self._resolved, self.model_type = resolve_sam_weights(
+            weights, allow_download, model_type or "sam2")
+        self._pred = None
+        self.key: tuple | None = None          # (scene_id, on) currently encoded
+        # One embedding is cached at a time, and torch is not reentrant, so all
+        # encode/decode traffic serialises here. Two people clicking different
+        # scenes at once will thrash the cache — acceptable for a localhost tool.
+        self.lock = threading.RLock()
+
+    def available(self) -> tuple[bool, str]:
+        try:
+            import ultralytics  # noqa: F401
+        except Exception:                                 # noqa: BLE001
+            return False, ("ultralytics is not installed — run `uv sync` "
+                           "(or `uv sync --group sam`)")
+        if self.model_type == "fastsam":
+            return False, ("click-to-segment needs a promptable SAM/SAM2 checkpoint — "
+                           "FastSAM has no reusable image embedding. Point "
+                           "backends.sam2.weights at a sam2*.pt")
+        if not self._resolved:
+            return False, ("no SAM2 weights — set backends.sam2.weights to a sam2*.pt, "
+                           "or backends.sam2.allow_download=true to fetch one")
+        return True, ""
+
+    def info(self) -> dict:
+        ok, reason = self.available()
+        return {"available": ok, "reason": reason,
+                "model": Path(str(self._resolved)).name if self._resolved else None,
+                "device": self.device}
+
+    def _predictor(self):
+        if self._pred is None:
+            from ultralytics.models.sam import Predictor, SAM2Predictor
+            cls = SAM2Predictor if self.model_type == "sam2" else Predictor
+            self._pred = cls(overrides=dict(
+                conf=0.25, task="segment", mode="predict", imgsz=1024,
+                model=self._resolved, verbose=False, save=False, device=self.device))
+        return self._pred
+
+    def prepare(self, key: tuple, image_bgr: np.ndarray) -> dict:
+        """Encode `image_bgr` unless `key` is already the cached embedding."""
+        with self.lock:
+            if self.key == key and self._pred is not None and self._pred.features is not None:
+                return {"ok": True, "cached": True, "elapsed_s": 0.0}
+            t0 = time.time()
+            pred = self._predictor()
+            try:
+                pred.reset_image()
+                pred.set_image(image_bgr)
+            except Exception as e:                        # noqa: BLE001
+                self.key = None
+                return {"ok": False, "error": f"SAM2 encode failed: {e}"}
+            self.key = key
+            return {"ok": True, "cached": False, "elapsed_s": round(time.time() - t0, 1)}
+
+    def ready(self, key: tuple) -> bool:
+        return (self.key == key and self._pred is not None
+                and getattr(self._pred, "features", None) is not None)
+
+    def predict(self, key: tuple, points: list, labels: list,
+                box: list | None = None, multimask: bool = False) -> tuple[np.ndarray | None, list, str | None]:
+        """Decode one prompt. Returns (masks (N,H,W) bool, scores, error).
+
+        Points and labels go in as ONE nested group so that positive and
+        negative clicks refine a single object, per the ultralytics prompt-shape
+        rule in CLAUDE.md; passing them flat makes each point its own object.
+        """
+        with self.lock:
+            if not self.ready(key):
+                return None, [], "scene not prepared — call prepare first"
+            kw: dict = {}
+            if points:
+                kw["points"] = [list(points)]
+                kw["labels"] = [list(labels)]
+            if box:
+                kw["bboxes"] = [list(box)]
+            if not kw:
+                return None, [], "no prompt given"
+            try:
+                res = self._pred(multimask_output=bool(multimask), **kw)
+            except Exception as e:                        # noqa: BLE001
+                return None, [], f"SAM2 inference failed: {e}"
+            if not res or res[0].masks is None:
+                return None, [], "SAM2 returned no mask for that prompt"
+            md = res[0].masks.data.cpu().numpy() > 0.5
+            # `.masks` can be present but empty — a box with no point prompt
+            # comes back as a (0, H, W) stack rather than None.
+            if md.shape[0] == 0:
+                return None, [], ("SAM2 found nothing for that prompt — add a point "
+                                  "inside the water")
+            scores = []
+            conf = getattr(getattr(res[0], "boxes", None), "conf", None)
+            if conf is not None:
+                try:
+                    scores = [round(float(c), 4) for c in conf.cpu().numpy()]
+                except Exception:                         # noqa: BLE001
+                    scores = []
+            return md, scores, None
+
+    def release(self) -> None:
+        """Drop the cached embedding (frees a few hundred MB)."""
+        with self.lock:
+            if self._pred is not None:
+                try:
+                    self._pred.reset_image()
+                except Exception:                         # noqa: BLE001
+                    pass
+            self.key = None
+
+
+def build_interactive(bcfg: dict | None = None, device: str = "auto") -> InteractiveSam:
+    """Click-to-segment session, configured from the `sam2` backend's settings."""
+    bcfg = bcfg or {}
+    cfg = bcfg.get("sam2", {})
+    return InteractiveSam(weights=cfg.get("weights"),
+                          model_type=cfg.get("model", "sam2"),
+                          allow_download=bool(cfg.get("allow_download", False)),
+                          device=cfg.get("device", device))
 
 
 # ---------------------------------------------------------------------------

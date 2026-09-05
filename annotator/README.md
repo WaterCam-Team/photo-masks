@@ -211,6 +211,23 @@ a comparison panel:
 If the verdict says they strongly disagree, treat every result as a rough
 draft. If nothing looks close, just **Clear all** and paint by hand.
 
+**Best of all, when the water is well defined: click it.** Pick the
+**Click (SAM2)** tool (`K`) and click on the water — SAM2 outlines it.
+
+- **Left click** = "this is water". **Shift-click** or **right-click** =
+  "this is not" — use it to cut back an outline that grabbed too much.
+- The first click on a scene pauses to encode it (~15–20 s on CPU, once).
+  Every click after that returns in well under a second.
+- One click is ambiguous — SAM2 offers three outlines (part / sub-part /
+  whole). Press **`C`** to cycle them.
+- Your existing painting is never lost: SAM2's outline is *added* to what you
+  already had. **New object** (`N`) banks the current result and starts a fresh
+  outline, so a scene with two ponds is two click sessions.
+- Then correct the edges with the brush as usual, and Save.
+
+Clicking is normally the fastest route to a good mask, because the bottleneck
+in the automatic backends is prompt quality — and your click *is* the prompt.
+
 ### 4 · Correct it
 
 | tool | what it does |
@@ -245,7 +262,8 @@ That's the loop. Once you have ~30–50 scenes, open **⚙ Train**, and the mode
 you train there becomes another auto-segmenter — so the next scenes arrive
 pre-labeled and the job gets faster.
 
-**Keys:** `B` brush · `E` erase · `F` fill · `[` `]` size · `U` undo ·
+**Keys:** `B` brush · `E` erase · `F` fill · `K` click-to-segment ·
+`C` cycle SAM2 candidates · `N` new object · `[` `]` size · `U` undo ·
 `R` redo · hold `Space` to pan · `Enter` save.
 
 ## What each backend does
@@ -260,6 +278,15 @@ pre-labeled and the job gets faster.
 | `sam2` | high-quality pass, same prompting → **ultralytics SAM 2.1-L**. Crisper boundaries, but *more literal about the prompt* (a bad spectral prompt → a precisely-wrong mask, where FastSAM's looseness sometimes rescues it). ~10–25 s/scene CPU. Best when a human places the prompt, or for an offline batch pass. | `ultralytics` + `sam2.1_l.pt` (`backends.sam2.weights`, or `allow_download: true`) | `on`, `n_pos`, `n_neg`, `use_box` |
 | `tinysam` | auto-picked points → TinySAM, as a subprocess | **external**: a TinySAM checkout + a driver script (neither ships here) + a Python with `tinysam`+`timm`; unconfigured it just shows as unavailable | `n_points` |
 | `segformer` | 5-band SegFormer inference from a **`.onnx`** (onnxruntime) **or an HF checkpoint dir** (`best_hf/`, via transformers); logs mean predictive entropy + low-confidence fraction for model-in-the-loop active learning. Fine-tune one from the ⚙ Train panel. | `onnxruntime` for .onnx, or `transformers`+`torch` for an HF dir | — |
+
+**Click-to-segment** is separate from that table: it is not a backend but an
+interactive session, driven by the `sam2` weights and the **Click (SAM2)**
+tool. It splits SAM2 the way SAM is meant to be used — the heavy image encoder
+runs once per scene and is cached, then each click only runs the light mask
+decoder. Measured on a 1296×972 scene, CPU: **~15–20 s to encode, ~70–150 ms
+per click.** Changing the `on` view (normal colour vs colour-IR) re-encodes.
+Requires a promptable `sam2*.pt`; FastSAM cannot do this — it has no reusable
+embedding.
 
 Setup notes for the model-based backends are in **Configuration → Which
 segmentation backends are available** below.
@@ -330,6 +357,8 @@ levels, one scene per directory.
 | `tiff_names` | `["color_preserved_5_band.tiff", "final_5_band.tiff"]` | filenames that mark a scene |
 | `exclude_dirs` | `.git .venv venv node_modules site-packages __pycache__` | path components to skip |
 | `max_depth` | `6` | max directory depth below a root |
+| `replicate_pct` | `0` | % of scenes served to more than one labeler, blind, for agreement scoring. 0 = off |
+| `replicates_per_scene` | `2` | how many people should label each replicate scene |
 
 ### GPU acceleration (NVIDIA, AMD, Intel, Apple)
 
@@ -454,6 +483,59 @@ model / weights / interpreter are missing.
 CLI shortcuts: `--device auto|cpu|cuda|rocm|mps|xpu`, `--disable nir` (repeatable), `--tinysam-python`,
 `--segformer-onnx`, `--segformer-size HxW`, `--segformer-water-class`.
 
+## Measuring agreement between labelers
+
+With several people labeling, the thing that quietly ruins a dataset is not
+sloppiness — it's two people answering *"is wet pavement water?"* differently
+and nobody noticing for months. Turn on the agreement sample:
+
+```jsonc
+"replicate_pct": 12,          // ~12% of scenes get a second opinion
+"replicates_per_scene": 2
+```
+
+What that does:
+
+- **Picks the sample deterministically** from a hash of the scene id, so it
+  never reshuffles as scenes are added and needs no extra state.
+- **Serves those scenes blind.** Anyone who hasn't labeled a replicate scene
+  gets it with `water_mask.png` hidden and the sidebar's "saved" chip
+  suppressed — seeing the first person's mask would turn an independence check
+  into an anchoring test. The queue is per-annotator, so a replicate scene
+  stays `pending` for whoever still owes it a second opinion.
+- **Keeps every mask.** Each save also writes
+  `work/masks/<scene-id>/<annotator>.png` and records it in the log's
+  `mask_path` column. The scene directory still only ever receives
+  `water_mask.png` (whoever saved last), so nothing downstream changes.
+
+Then score it:
+
+```bash
+python ../agreement.py --label-log work/label_log.csv --csv agreement.csv
+```
+
+| metric | what it tells you |
+|---|---|
+| **IoU** | the headline, directly comparable to model mIoU |
+| **Cohen's κ** | chance-corrected — water is ~7% of a frame, so raw pixel agreement reads ~93% for two people who agree on nothing |
+| **boundary F1** (±3 px) | the actionable one: **high** boundary F1 with lower IoU means you disagree about *where the waterline is* (expected, harmless). **Low** boundary F1 means you disagree about *what counts as water* — that's a `LABELING_GUIDE.md` problem |
+| **water % per annotator** | catches someone systematically over-calling |
+
+It also lists the worst-disagreement scenes to adjudicate first, and flags
+scenes where one person labeled and another rejected. Every resolution should
+end up as a clarified rule in `LABELING_GUIDE.md` — that is the point of the
+exercise, not the number.
+
+**Human agreement is the ceiling for your model.** A SegFormer mIoU above the
+IoU two annotators reach on the same scenes is measuring label noise, not
+skill. `export_dataset.py --gold-only` therefore routes every double-labeled
+scene to **val** rather than train (`--replicates-in-train` opts out), giving
+you the hand-labelled validation set the training notes ask for.
+
+> Attribution is self-reported: the name comes from the browser's
+> `localStorage` and there is no authentication, so these numbers measure
+> honest disagreement between colleagues, not anything adversarial.
+
 ## The RL decision log — `work/label_log.csv`
 
 One row per Save or Reject. Columns that matter for the routing reward
@@ -472,6 +554,8 @@ One row per Save or Reject. Columns that matter for the routing reward
 | `ensemble_disagreement_frac` | fraction of pixels the backends split on — high ⇒ hard scene ⇒ route to human |
 | `n_backends_run` | how many backends the ensemble ran |
 | `features_json` | per-scene band / NDWI / texture descriptors = the policy's state |
+| `n_clicks` | SAM2 click-to-segment prompt points the human placed |
+| `mask_path` | this annotator's own copy of the mask, for agreement scoring |
 
 `work/features/<scene>.json` caches the features; `work/state.json` holds
 per-scene review status.

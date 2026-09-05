@@ -26,6 +26,10 @@ Two selection modes:
       auto_vs_final_iou, edited_pixel_frac, active_seconds, annotator, time)
       so the training set has an audit trail. Train/val split is by a stable
       hash of the scene name, so it doesn't reshuffle as labels accumulate.
+      Scenes labeled by more than one person go to val instead: they are the
+      only ones whose human-human agreement is measurable, which makes them
+      the honest validation set. See agreement.py; --replicates-in-train opts
+      out.
 
 Usage examples:
     python export_dataset.py /data/captures/ /path/to/5band_data/
@@ -55,7 +59,7 @@ GOLD_ROUTES = {"auto_accepted", "auto_edited", "manual_from_scratch"}
 
 HERE = Path(__file__).resolve().parent
 PROVENANCE_FIELDS = [
-    "split", "stem", "scene_dir", "route", "seed_backend",
+    "split", "stem", "scene_dir", "route", "seed_backend", "n_annotators",
     "auto_vs_final_iou", "edited_pixel_frac", "active_seconds",
     "ensemble_agreement", "ensemble_disagreement_frac",
     "annotator", "timestamp",
@@ -156,11 +160,15 @@ def load_label_log(path: Path) -> list[dict]:
 def collect_gold(log_rows: list[dict]) -> list[dict]:
     """Latest decision per scene; keep only human-verified routes with a mask."""
     latest: dict[str, dict] = {}
+    annotators: dict[str, set] = {}
     for r in log_rows:
         raw = (r.get("scene_dir") or "").strip()
         if not raw:                       # check before resolve(): Path("") is the cwd
             continue
         sd = str(Path(raw).resolve())
+        who = (r.get("annotator") or "").strip()
+        if who:
+            annotators.setdefault(sd, set()).add(who)
         prev = latest.get(sd)
         if prev is None or r.get("timestamp", "") >= prev.get("timestamp", ""):
             latest[sd] = r
@@ -192,6 +200,7 @@ def collect_gold(log_rows: list[dict]) -> list[dict]:
             "ensemble_disagreement_frac": r.get("ensemble_disagreement_frac", ""),
             "annotator": r.get("annotator", ""),
             "timestamp": r.get("timestamp", ""),
+            "n_annotators": len(annotators.get(sd, set())) or 1,
         })
     if skipped_route:
         log.info(f"  excluded {skipped_route} scene(s): not a human-verified route "
@@ -218,6 +227,11 @@ def main():
                    help="Path to the annotator's work/label_log.csv (--gold-only)")
     p.add_argument("--val-split", type=float, default=0.2, dest="val_split",
                    help="Fraction of scenes for validation. Default: 0.2")
+    p.add_argument("--replicates-in-train", action="store_true", dest="replicates_in_train",
+                   help="Let double-labeled scenes be split normally. By default they "
+                        "all go to val: they are the only scenes whose human-human "
+                        "agreement is known, which makes them the honest val set (and "
+                        "the ceiling your mIoU should be read against — see agreement.py).")
     p.add_argument("--dry-run", action="store_true", dest="dry_run",
                    help="Print what would be done without writing files")
     args = p.parse_args()
@@ -236,8 +250,18 @@ def main():
         if not items:
             log.error("No gold (human-verified) scenes in the label log.")
             sys.exit(1)
+        n_rep = 0
         for it in items:
-            it["_split"] = hash_split(scene_stem(it), args.val_split)
+            replicated = int(it.get("n_annotators", 1) or 1) > 1
+            if replicated and not args.replicates_in_train:
+                it["_split"] = "val"
+                n_rep += 1
+            else:
+                it["_split"] = hash_split(scene_stem(it), args.val_split)
+        if n_rep:
+            log.info(f"  {n_rep} double-labeled scene(s) held out as val "
+                     f"(their mask is the most recent annotator's — adjudicate "
+                     f"disagreements first; see agreement.py)")
         resolve_mask = lambda it: Path(it["scene_dir"]) / "water_mask.png"  # noqa: E731
         route_counts = Counter(it["route"] for it in items)
         log.info(f"Gold scenes: {len(items)}  routes={dict(route_counts)}")

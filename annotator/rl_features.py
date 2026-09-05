@@ -30,6 +30,11 @@ LOG_HEADER = [
     "seg_mean_entropy", "seg_low_conf_frac",
     "ensemble_agreement", "ensemble_disagreement_frac", "n_backends_run",
     "features_json",
+    # appended (invariant 5: new columns go at the end, never reordered)
+    "n_clicks",        # SAM2 click-to-segment prompt points the human placed
+    "mask_path",       # this annotator's own copy of the mask, kept for
+                       # inter-annotator agreement — water_mask.png in the scene
+                       # dir is overwritten by whoever saves last
 ]
 
 

@@ -71,10 +71,12 @@ boundary snap) exists only in the contrib build.
 | file | role |
 |---|---|
 | `server.py` | stdlib `ThreadingHTTPServer` app: config, scene discovery, band rendering, save/ensemble/train routes, `TrainManager` |
-| `backends.py` | 8 auto-seg adapters behind one `Backend` interface + `build_registry()` + device resolution |
+| `backends.py` | 8 auto-seg adapters behind one `Backend` interface + `build_registry()` + device resolution + `InteractiveSam` (click-to-segment) |
 | `autolabel.py` | `spectral_water()` fusion engine and `derive_prompts()` — pure numpy/cv2, no torch |
-| `trainer.py` | 5-band SegFormer fine-tune (HF transformers) + ONNX export; streams JSONL |
+| `trainer.py` | thin adapter over `../training/` keeping the Train panel's CLI + JSONL stable; ONNX export |
+| `../training/` | the real training pipeline: modalities, band stats, augmentation, losses, metrics, resume, TTA, modality×model comparison. See `training/README.md` |
 | `rl_features.py` | `scene_features()`, mask IoU / edit-fraction, `label_log.csv` writer |
+| `../agreement.py` | offline inter-annotator agreement over `work/masks/` (IoU, kappa, boundary F1) |
 | `frontend/` | `index.html` · `style.css` · `app.js` — canvas labeler + ensemble panel + train panel, zero JS dependencies |
 | `LABELING_GUIDE.md` | class definitions — **read before labeling or changing class semantics** |
 
@@ -108,6 +110,7 @@ scene dir/                      work/
   water_mask.png   ← ONLY file    state.json           per-scene review status
                      we write     features/<id>.json   cached scene features
                                   cache/<id>/          transient auto/ensemble masks
+                                  masks/<id>/<who>.png per-annotator mask (agreement)
                                   dataset/             --gold-only export target
                                   runs/<ts>/           best.pt, best_hf/, metrics.json, train.log
 ```
@@ -155,7 +158,43 @@ trainer. Per-backend override: `backends.<name>.device`.
    `clean_annotator()`, which falls back to the server's `--annotator`.
 6. **Torch backends hold a `threading.Lock` around inference.** The server is
    threaded; a shared torch module is not reentrant.
-7. **`#preview` is read-only.** The canvas stack is `#bg` (1) → `#preview` (2)
+7. **Click-to-segment caches ONE embedding, and the key must match.**
+   `InteractiveSam` holds `(scene_id, on)`; `predict()` refuses when the key
+   differs rather than decoding a click against the wrong scene's features.
+   Encoding is ~15-20 s CPU and decoding ~70-150 ms — that ratio is the whole
+   reason the feature is usable, so never re-encode per click.
+8. **A trained checkpoint carries its own preprocessing.** `training/` writes
+   `best_hf/norm.json` (modality + per-band statistics) and the `segformer`
+   backend reads it, so a served model is normalised exactly as it was
+   trained. ONNX export copies it beside the `.onnx` as `<stem>.norm.json`.
+   A checkpoint with no norm.json is legacy per-image min-max at 512x512;
+   one with it runs at native resolution padded to /32, because that is what
+   it was validated on. Never normalise in one place only — that is the bug
+   `segformer_5band/PERFORMANCE.md` documented, and it is invisible in tests.
+9. **Splits are assigned per capture session, never per scene.** The rig
+   fires repeatedly within a session — `20251229-1427`, `-14270`, `-1428`,
+   `-1429` are the same view seconds apart. Splitting those individually puts
+   near-duplicate frames on both sides and the val score measures
+   memorisation: on the 13 labelled scenes a per-scene split scored 0.98 mIoU
+   where a session-grouped split scored ~0.6. `training/manifest.py` groups by
+   the scene's parent directory (`--group-by scene` opts out). Anything that
+   reassigns splits must keep whole sessions together.
+10. **Two mask encodings are in circulation.** The annotator writes
+   `water_mask.png` as **0/255**; `export_dataset.py` converts to class
+   indices **0/1**. Threshold masks at `> 0`, never `> 127` — at 127 every
+   exported mask reads as all background: empty labels, no error, a model
+   that predicts nothing. `training/engine.py` refuses to train on a split
+   whose measured water fraction is 0.
+11. **Painting repaints a dirty rect, not the frame.** `stamp()` marks the
+   region it touched and maintains `S.waterCount` incrementally;
+   `scheduleRender()` coalesces to one `putImageData` per animation frame over
+   just that rect. Anything that replaces `S.mask` wholesale (undo, fill,
+   clean, load, SAM) must call `renderMask()`, which recounts and repaints in
+   full. Getting this wrong leaves stale pixels or a drifting water %.
+12. **A replicate scene is served blind.** If `blind_for()` is true, the
+   `/api/scene/<id>` response must not list `water_mask.png` and the sidebar
+   must not flag `has_manual` — an anchored second opinion is not evidence.
+13. **`#preview` is read-only.** The canvas stack is `#bg` (1) → `#preview` (2)
    → `#mask` (3). Hover-previews and the disagreement map draw to `#preview`
    and must never write `S.mask` — previewing has to stay non-destructive.
    `#preview` has `pointer-events: none` so it can't swallow brush strokes.
@@ -202,6 +241,38 @@ trainer. Per-backend override: `backends.<name>.device`.
   a lone dissenter fades and near-even splits dominate. **If you change the
   palette, change `style.css`'s `.sw.*` legend swatches too** — they're hand-
   mirrored from the `*_RGB` constants in `server.py`.
+- **ultralytics numpy input is BGR.** Its loader documents numpy arrays as
+  OpenCV-order BGR and `preprocess` does `im[..., ::-1]`, so handing it an RGB
+  array silently swaps red and blue before the model sees it. `sam_prompt_image()`
+  is the single place that builds SAM's 3-channel input; keep it BGR.
+- **A SAM2 box-only prompt returns an empty stack, not None.** `res[0].masks`
+  is present with shape `(0, H, W)`, so checking `masks is None` isn't enough —
+  check `shape[0] == 0` too, or you return "ok" with no mask.
+- **`transformers` 5.x moved SegFormer's module paths.** The stem is now
+  `segformer.stages.0.patch_embeddings.proj`, not
+  `segformer.encoder.patch_embeddings[0].proj`. The old 5-band warm-start
+  looked that path up inside a `try/except` and so silently degraded to a
+  random stem while still logging "pretrained". `training/models/base.py`
+  locates the stem structurally — the first `Conv2d` in `named_modules()`
+  order, verified for both SegFormer and Mask2Former — and *raises* if it
+  cannot find one.
+- **ONNX export needs opset >= 14, and 13 was hard-coded.** SegFormer
+  attention in `transformers` 5.x lowers to
+  `aten::scaled_dot_product_attention`, unsupported at 13; the export died
+  before it ever reached the missing-`onnx`-package check. Now opset 17.
+- **The thermal band is warped, the optical band is only resized.** TIFF bands
+  0-2 match `*-NIR-OFF.jpg` downscaled 2x to MAE 0.00, but band 3 differs from
+  the raw `IMG_*.pgm` upsampled by MAE 12.4. So a thermal modality must read
+  the TIFF band (the `.pgm` is in the Lepton's own 160x120 geometry and does
+  not line up with the mask), while `rgb_nofilt` may legitimately downscale
+  `*-NIR-ON.jpg` onto the grid. Re-check with
+  `training.modalities.verify_provenance()` on new capture sessions — that
+  second fact stops being true the moment co-registration starts warping the
+  optical frame.
+- **Mask2Former does not take a pixel loss.** It is a mask classifier trained
+  by Hungarian matching and computes its own objective, so `--loss ce+lovasz`
+  cannot apply to it. `supports_pixel_loss` says so and the run metadata
+  records `pixel_loss_applies`, rather than accepting a flag that does nothing.
 - **Always look at a rendered overlay before believing it works.** The bug
   above passed every numeric check; only compositing it over the photo showed
   the problem.
@@ -217,7 +288,12 @@ Don't re-propose these without new information:
   prediction. HF `transformers` is the path.
 - **An mmseg-based trainer** — `mmcv` pins hard to old torch/py versions and
   brings a second config system for no gain here. HF `transformers` covers
-  SegFormer and is what the ONNX export path already expects.
+  SegFormer and is what the ONNX export path already expects. `../training/`
+  is that path, and it ports the *ideas* from `segformer_5band` (band-statistic
+  normalisation, Lovász loss, class weights, TTA, the four-modality
+  comparison) without `mmcv`. The old tree still exists at
+  `../../segformer_5band` for reference; it does not build against current
+  torch (`build_segmentor` fails on `mit_b2: unexpected keyword 'style'`).
 - **Satellite/SAR flood models** (Sen1Floods11, WorldFloods, ETCI-2021) — nadir,
   10 m GSD, wrong physics. Zero transfer to an oblique ground-level camera.
 - **The Ryzen AI NPU** — Linux stack is ONNX/INT8-only with a Windows-centric
@@ -244,8 +320,14 @@ uv run server.py --root $SP/caps --work-dir $SP/w --port 8799
 Checks that catch most regressions:
 
 ```bash
-uv run python -m py_compile *.py && node --check frontend/app.js
+uv run python -m py_compile *.py ../training/*.py ../training/models/*.py
+node --check frontend/app.js
 uv run server.py --print-config
+# the training pipeline, end to end on the bundled scenes (no archive needed):
+cd .. && uv run --project annotator python -c "
+from pathlib import Path
+from training.modalities import verify_provenance
+print(verify_provenance(Path('example_data/Brooklyn')))"   # band provenance still holds
 # every id in app.js exists in index.html:
 python - <<'EOF'
 import re; js=open('frontend/app.js').read(); html=open('frontend/index.html').read()
@@ -271,20 +353,24 @@ a separate py3.12 venv for an AMD iGPU (README → "Integrated AMD Radeon").
 
 **Deferred improvements**, roughly by value:
 
-1. **Interactive click-to-prompt for SAM** — biggest quality lever left, since
-   prompt quality is the bottleneck. Click water / click not-water → re-run.
-   The `#preview` layer added for hover-previews is the natural place to show
-   the prompt points.
-2. Dirty-rect mask rendering (`renderMask()` rebuilds a full 1.26 M-px
-   ImageData per pointer-move; laggy on weak GPUs). `drawMaskPreview()` has the
-   same cost per hover — cache the tinted ImageData per row if it drags.
-3. Trainer `--resume` from `last.pt`.
-4. Unit tests (`_slug`, `_deep_merge`/config precedence, `classify_route`,
+1. ~~Interactive click-to-prompt for SAM~~ — **done.** `InteractiveSam` +
+   the Click (SAM2) tool; prompt points draw on `#preview`.
+2. ~~Dirty-rect mask rendering~~ — **done.** Dirty rect + rAF coalescing +
+   incremental water count (~14,000x less per-stroke work); hover previews are
+   cached as `ImageBitmap`s.
+3. Undo as dirty-rect deltas — `snapshot()` still copies the whole 1.26 MB
+   mask per stroke (~38 MB of history per scene). The bookkeeping now exists
+   to store `{x, y, w, h, before}` instead.
+4. ~~Trainer `--resume` from `last.pt`~~ — **done.** `training.train --resume`
+   restores model, optimizer, scheduler, scaler, epoch, best and the
+   early-stop counter from `ckpt.pt`, which is written *after* each eval so
+   `best` is never one eval stale.
+5. Unit tests (`_slug`, `_deep_merge`/config precedence, `classify_route`,
    `hash_split`, `spectral_water` on a synthetic array).
-5. Incremental `train.log` parsing (`_events()` re-reads the whole file each poll).
-6. `features()` computed outside `app.lock` (~1 s under the global lock per save).
-7. `build_model` loads `nvidia/mit-b0` twice (model + stem warm-start source).
-8. `--token` auth — `--host 0.0.0.0` still has none. A non-wildcard bind pins
+6. Incremental `train.log` parsing (`_events()` re-reads the whole file each poll).
+7. `features()` computed outside `app.lock` (~1 s under the global lock per save).
+8. `build_model` loads `nvidia/mit-b0` twice (model + stem warm-start source).
+9. `--token` auth — `--host 0.0.0.0` still has none. A non-wildcard bind pins
    `Host`/`Origin` (see `Handler._origin_ok`), which blocks cross-origin drive-by
    requests and DNS rebinding but is **not** authentication. Localhost + SSH
    tunnel is the documented deployment and the README warns about this in a

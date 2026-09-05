@@ -166,3 +166,60 @@ header #btn-train { margin-left: 8px; padding: 4px 10px; min-height: 28px; }
 #toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
 #toast.ok { border-color: var(--ok); }
 #toast.bad { border-color: var(--danger); }
+
+/* click-to-segment tool strip: inline with the other tool controls, and its
+   status text is allowed to grow without pushing the buttons around */
+#click-group { display: inline-flex; align-items: center; gap: 8px; }
+#click-group[hidden] { display: none; }
+#click-status { min-width: 12ch; }
+#click-status.busy::before {
+  content: ""; display: inline-block; vertical-align: -1px; margin-right: 6px;
+  width: 10px; height: 10px; border-radius: 50%;
+  border: 2px solid rgba(255,255,255,.2); border-top-color: var(--accent);
+  animation: sam-spin .7s linear infinite;
+}
+
+/* "SAM2 is working" on the canvas itself. The toolbar status line is easy to
+   miss — while you wait your eye is on the spot you just clicked, not the
+   toolbar. Both layers sit above #mask and are pointer-inert, so they can
+   never swallow a click (see invariant 10). */
+#sam-pending {
+  position: absolute; z-index: 4; pointer-events: none;
+  width: 30px; height: 30px; margin: -15px 0 0 -15px;
+  --sam-ring: var(--accent);
+}
+#sam-pending.neg { --sam-ring: var(--danger); }
+#sam-pending::before, #sam-pending::after {
+  content: ""; position: absolute; inset: 0; border-radius: 50%;
+  border: 2px solid var(--sam-ring);
+  box-shadow: 0 0 0 1px rgba(0,0,0,.7), inset 0 0 0 1px rgba(0,0,0,.7);
+  animation: sam-pulse 1.1s ease-out infinite;
+}
+#sam-pending::after { animation-delay: .55s; }
+@keyframes sam-pulse {
+  from { transform: scale(.35); opacity: 1; }
+  to   { transform: scale(1.3); opacity: 0; }
+}
+#sam-overlay {
+  position: absolute; inset: 0; z-index: 5; pointer-events: none;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 12px; background: rgba(12,14,18,.6);
+}
+#sam-overlay[hidden] { display: none; }
+.sam-spin {
+  width: 34px; height: 34px; border-radius: 50%;
+  border: 3px solid rgba(255,255,255,.18); border-top-color: var(--accent);
+  animation: sam-spin .8s linear infinite;
+}
+@keyframes sam-spin { to { transform: rotate(360deg); } }
+.sam-msg {
+  background: #0d1117cc; border: 1px solid var(--line); border-radius: 8px;
+  padding: 7px 14px; font-size: 13px; max-width: 80%; text-align: center;
+}
+#mask.waiting { cursor: progress; }
+@media (prefers-reduced-motion: reduce) {
+  #click-status.busy::before, #sam-pending::before, #sam-pending::after, .sam-spin
+    { animation: none; }
+  #sam-pending::before { opacity: 1; transform: scale(1); }
+  #sam-pending::after  { display: none; }
+}

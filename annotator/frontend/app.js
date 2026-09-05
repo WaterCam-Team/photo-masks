@@ -26,6 +26,7 @@ async function api(p, opt) {
 const WATER_RGB = [0, 200, 255];
 const IDLE_MS = 12000;          // activity older than this doesn't count as "active"
 const UNDO_CAP = 30;
+const PENDING_MIN_MS = 320;      // minimum on-screen life of the SAM2 click ring
 // per-row preview colours; distinguishable under common colour-vision deficiencies
 const PREVIEW_COLOURS = [
   [255, 255, 255], [0, 190, 200], [245, 180, 0], [230, 70, 200],
@@ -54,8 +55,19 @@ const S = {
   votesUrl: null,               // disagreement-map overlay for the current scene
   showVotes: false,             // is the disagreement map pinned on?
   imgCache: {},                 // url -> HTMLImageElement (preview hovers)
+  tintCache: {},                // url|rgb -> ImageBitmap (tinted hover preview)
   nStrokes: 0, nUndos: 0,
   activeSeconds: 0, lastActivity: 0, timer: null,
+  // --- render bookkeeping -------------------------------------------
+  waterCount: 0,                // set pixels in S.mask, maintained incrementally
+  dirty: null,                  // {x0,y0,x1,y1} awaiting repaint, null = clean
+  rafPending: false,            // a repaint is already scheduled for this frame
+  rectCache: null,              // #mask bounding rect, refreshed per stroke
+  // --- click-to-segment (SAM2) --------------------------------------
+  click: { ready: false, busy: false, on: null, pts: [], labels: [],
+           base: null, cands: [], idx: 0, total: 0,
+           pending: null,          // {x,y,neg} point SAM2 is decoding right now
+           pendingAt: 0, pendingTimer: null },
 };
 
 /* ------------------------------------------------------------------ boot */
@@ -190,7 +202,7 @@ function collectParams() {
 
 /* ------------------------------------------------------------ scene list */
 async function refreshScenes() {
-  const r = await api("/api/scenes");
+  const r = await api("/api/scenes?annotator=" + encodeURIComponent(annotatorName()));
   S.scenes = r.scenes;
   const done = S.scenes.filter((s) => s.review_status !== "pending").length;
   $("#progress").textContent = `${done} / ${S.scenes.length} reviewed`;
@@ -214,7 +226,7 @@ async function refreshScenes() {
 /* --------------------------------------------------------- load a scene */
 async function loadScene(id) {
   if (S.scene && S.undo.length && !confirm("Discard unsaved edits on this scene?")) return;
-  const d = await api("/api/scene/" + id);
+  const d = await api("/api/scene/" + id + "?annotator=" + encodeURIComponent(annotatorName()));
   if (d.error) return toast(d.error, "bad");
   S.scene = d;
   [S.H, S.W] = d.size;
@@ -223,6 +235,12 @@ async function loadScene(id) {
   S.grayCache = {};
   S.seedBackend = null; S.backendParams = {}; S.segMeta = {}; S.ensemble = {};
   S.votesUrl = null; S.showVotes = false; S.imgCache = {};
+  dropTintCache();
+  S.waterCount = 0; S.dirty = null; invalidateRect();
+  S.click.ready = false; S.click.on = null;      // a new scene needs a new embedding
+  resetClickSession(false);
+  if (S.tool === "click") setTool("brush");
+  clickStatus("");
   $("#ensemble-panel").hidden = true;
   $("#ens-legend").hidden = true;
   $("#ens-votes").classList.remove("on");
@@ -266,24 +284,74 @@ async function drawBackground() {
   ctx.drawImage(img, 0, 0, S.W, S.H);
 }
 
-/* --------------------------------------------------------------- render */
-function renderMask() {
-  const d = S.maskImage.data;
+/* --------------------------------------------------------------- render
+   A brush stroke changes a few hundred pixels, so repainting all 1.26 M and
+   re-uploading the whole 5 MB ImageData per pointermove was ~5000x more work
+   than the edit itself. Three things fix that: bound the repaint to a dirty
+   rectangle, upload only that rectangle, and coalesce to one repaint per
+   animation frame. The water-% readout is likewise maintained incrementally
+   in stamp() instead of recounting the image every frame. */
+
+function markDirty(x0, y0, x1, y1) {
+  if (x1 < x0 || y1 < y0) return;                 // fully off-canvas stamp
+  const d = S.dirty;
+  if (!d) { S.dirty = { x0, y0, x1, y1 }; return; }
+  if (x0 < d.x0) d.x0 = x0;
+  if (y0 < d.y0) d.y0 = y0;
+  if (x1 > d.x1) d.x1 = x1;
+  if (y1 > d.y1) d.y1 = y1;
+}
+
+function markAllDirty() { markDirty(0, 0, S.W - 1, S.H - 1); }
+
+/** Repaint the pending dirty rect now. */
+function flushRender() {
+  const d = S.dirty;
+  if (!d || !S.maskImage) return;
+  S.dirty = null;
+  const data = S.maskImage.data;
   const [wr, wg, wb] = WATER_RGB;
-  for (let i = 0, j = 0; i < S.mask.length; i++, j += 4) {
-    if (S.mask[i]) { d[j] = wr; d[j + 1] = wg; d[j + 2] = wb; d[j + 3] = 255; }
-    else { d[j + 3] = 0; }
+  for (let y = d.y0; y <= d.y1; y++) {
+    let i = y * S.W + d.x0;
+    let j = i * 4;
+    for (let x = d.x0; x <= d.x1; x++, i++, j += 4) {
+      if (S.mask[i]) { data[j] = wr; data[j + 1] = wg; data[j + 2] = wb; data[j + 3] = 255; }
+      else { data[j + 3] = 0; }
+    }
   }
-  $("#mask").getContext("2d").putImageData(S.maskImage, 0, 0);
+  $("#mask").getContext("2d")
+    .putImageData(S.maskImage, 0, 0, d.x0, d.y0, d.x1 - d.x0 + 1, d.y1 - d.y0 + 1);
   updateWaterPct();
 }
 
-function updateWaterPct() {
+/** Painting path: coalesce many pointer events into one repaint per frame. */
+function scheduleRender() {
+  if (S.rafPending) return;
+  S.rafPending = true;
+  requestAnimationFrame(() => { S.rafPending = false; flushRender(); });
+}
+
+/** Wholesale mask replacement (undo, fill, clean, load, SAM): repaint all. */
+function renderMask() {
+  recountWater();
+  markAllDirty();
+  flushRender();
+}
+
+function recountWater() {
   let n = 0;
   for (let i = 0; i < S.mask.length; i++) if (S.mask[i]) n++;
-  const pct = (100 * n / S.mask.length).toFixed(1);
+  S.waterCount = n;
+}
+
+function updateWaterPct() {
+  const pct = (100 * S.waterCount / S.mask.length).toFixed(1);
   $("#water-pct").textContent = pct + " %";
 }
+
+/* The canvas rect is only read once per stroke rather than per pointermove;
+   getBoundingClientRect() can force a synchronous layout. */
+function invalidateRect() { S.rectCache = null; }
 
 function applyZoom() {
   const z = S.zoom;
@@ -293,6 +361,9 @@ function applyZoom() {
   }
   $("#canvas-pad").style.width = (S.W * z) + "px";
   $("#canvas-pad").style.height = (S.H * z) + "px";
+  invalidateRect();
+  drawClickPoints();
+  showPendingPoint();          // keep the busy ring on its pixel
 }
 
 /* ------------------------------------------------- preview overlay layer
@@ -317,12 +388,19 @@ async function drawOverlay(url) {
   $("#preview").getContext("2d").drawImage(img, 0, 0, S.W, S.H);
 }
 
-/** Draw a binary mask PNG tinted `rgb`, at low alpha, without altering S.mask. */
-async function drawMaskPreview(url, rgb) {
+/** Tint a binary mask PNG once and keep the result as a GPU-side bitmap.
+
+    The tint needs getImageData(), which stalls on a GPU->CPU readback, plus a
+    full-image pass. Doing that on every mouseenter made running down the
+    ensemble list expensive; caching per (url, colour) makes repeat hovers a
+    bare drawImage. */
+async function tintedBitmap(url, rgb) {
+  const key = url + "|" + rgb.join(",");
+  if (S.tintCache[key]) return S.tintCache[key];
   const img = await cachedImg(url);
   const c = document.createElement("canvas");
   c.width = S.W; c.height = S.H;
-  const cx = c.getContext("2d");
+  const cx = c.getContext("2d", { willReadFrequently: true });
   cx.drawImage(img, 0, 0, S.W, S.H);
   const src = cx.getImageData(0, 0, S.W, S.H);
   const d = src.data;
@@ -331,14 +409,26 @@ async function drawMaskPreview(url, rgb) {
     if (d[j] > 127) { d[j] = r; d[j + 1] = g; d[j + 2] = b; d[j + 3] = 150; }
     else { d[j + 3] = 0; }
   }
+  S.tintCache[key] = await createImageBitmap(src);
+  return S.tintCache[key];
+}
+
+/** Draw a binary mask PNG tinted `rgb`, at low alpha, without altering S.mask. */
+async function drawMaskPreview(url, rgb) {
+  const bmp = await tintedBitmap(url, rgb);
   clearPreview();
-  $("#preview").getContext("2d").putImageData(src, 0, 0);
+  $("#preview").getContext("2d").drawImage(bmp, 0, 0);
+}
+
+function dropTintCache() {
+  for (const b of Object.values(S.tintCache)) { try { b.close(); } catch { /* ignore */ } }
+  S.tintCache = {};
 }
 
 /** Back to whatever should be showing when nothing is hovered. */
 function restorePreview() {
-  if (S.showVotes && S.votesUrl) drawOverlay(S.votesUrl).catch(() => {});
-  else clearPreview();
+  if (S.showVotes && S.votesUrl) drawOverlay(S.votesUrl).then(drawClickPoints).catch(() => {});
+  else { clearPreview(); drawClickPoints(); }
 }
 
 /* ---------------------------------------------------------- undo / redo */
@@ -365,7 +455,8 @@ function redo() {
 
 /* --------------------------------------------------------------- paint */
 function evToPx(e) {
-  const r = $("#mask").getBoundingClientRect();
+  if (!S.rectCache) S.rectCache = $("#mask").getBoundingClientRect();
+  const r = S.rectCache;
   return {
     x: Math.floor((e.clientX - r.left) / S.zoom),
     y: Math.floor((e.clientY - r.top) / S.zoom),
@@ -381,10 +472,15 @@ function stamp(cx, cy, val) {
       const dx = x - cx, dy = y - cy;
       if (dx * dx + dy * dy <= r2) {
         const i = y * S.W + x;
-        if (S.mask[i] !== val) { S.mask[i] = val; S.strokeDirty = true; }
+        if (S.mask[i] !== val) {
+          S.mask[i] = val;
+          S.waterCount += val ? 1 : -1;
+          S.strokeDirty = true;
+        }
       }
     }
   }
+  markDirty(x0, y0, x1, y1);
 }
 
 function paintLine(a, b, val) {
@@ -435,6 +531,232 @@ async function floodFill(px) {
   }
   renderMask();
   toast(`filled ${count.toLocaleString()} px (tol ${tol})`);
+}
+
+/* ------------------------------------------------ click-to-segment (SAM2)
+   Encoding a scene costs ~15-20 s on CPU; a click against the cached
+   embedding costs ~70-150 ms. So selecting the tool pays the encode once,
+   and every click after it is interactive.
+
+   Clicks refine ONE object: left click adds a positive point, shift/right
+   click a negative one. The object is unioned onto whatever you had already
+   painted (`click.base`), so SAM never wipes your manual work. "New object"
+   banks the current result as the new base and starts a fresh prompt. */
+
+function clickStatus(msg, busy) {
+  $("#click-status").textContent = msg || "";
+  $("#click-status").classList.toggle("busy", !!busy);
+  $("#mask").classList.toggle("waiting", !!busy);
+  $("#btn-click-new").disabled = !!busy || !S.click.pts.length;
+  $("#btn-click-undo").disabled = !!busy || !S.click.pts.length;
+  // Every SAM2 operation ends with a clickStatus() that isn't busy — including
+  // the error paths, scene loads and tool switches — so clearing the on-canvas
+  // indicators here means they can never be left spinning.
+  if (!busy) { hidePendingPoint(); hideSamOverlay(); }
+}
+
+/* --- "SAM2 is working" on the canvas ------------------------------------
+   The toolbar status text alone isn't enough: you click the water and then
+   watch the water, so the wait has to be visible where you are looking.
+   A click gets a pulsing ring at the point being decoded (~200 ms, but it
+   confirms the click landed); the one-off scene encode gets a covering
+   overlay, because a silent 20 s wait reads as a broken tool. */
+
+/** Show a pulsing ring at `px` (image pixels), or re-place the current one. */
+function showPendingPoint(px, negative) {
+  const el = $("#sam-pending");
+  if (px) {
+    clearTimeout(S.click.pendingTimer);
+    S.click.pendingTimer = null;
+    S.click.pending = { x: px.x, y: px.y, neg: !!negative };
+    S.click.pendingAt = Date.now();
+  }
+  const p = S.click.pending;
+  if (!p) { el.hidden = true; return; }
+  el.style.left = (p.x * S.zoom) + "px";
+  el.style.top = (p.y * S.zoom) + "px";
+  el.classList.toggle("neg", p.neg);
+  el.hidden = false;
+}
+
+/* A decode against the cached embedding takes ~200 ms, so a ring that
+   disappears the moment the reply lands is a flicker you can miss. Hold it
+   for PENDING_MIN_MS so a click always leaves a mark you actually see. */
+function hidePendingPoint() {
+  if (S.click.pending) {
+    const left = PENDING_MIN_MS - (Date.now() - S.click.pendingAt);
+    if (left > 0) {
+      if (!S.click.pendingTimer) {
+        S.click.pendingTimer = setTimeout(hidePendingPoint, left);
+      }
+      return;
+    }
+  }
+  clearTimeout(S.click.pendingTimer);
+  S.click.pendingTimer = null;
+  S.click.pending = null;
+  $("#sam-pending").hidden = true;
+}
+
+function showSamOverlay(msg) {
+  $("#sam-overlay-msg").textContent = msg;
+  $("#sam-overlay").hidden = false;
+}
+
+function hideSamOverlay() { $("#sam-overlay").hidden = true; }
+
+function resetClickSession(keepBase) {
+  S.click.pts = [];
+  S.click.labels = [];
+  S.click.cands = [];
+  S.click.idx = 0;
+  S.click.total = 0;
+  if (!keepBase) S.click.base = null;
+  drawClickPoints();
+}
+
+/** Draw the prompt points on the read-only preview layer. */
+function drawClickPoints() {
+  if (!S.scene || !S.click.pts.length) return;
+  const cx = $("#preview").getContext("2d");
+  const r = Math.max(4, Math.round(6 / Math.max(S.zoom, 0.35)));
+  S.click.pts.forEach((p, i) => {
+    const pos = S.click.labels[i] === 1;
+    cx.beginPath();
+    cx.arc(p[0], p[1], r, 0, Math.PI * 2);
+    cx.fillStyle = pos ? "rgba(0,220,140,0.95)" : "rgba(255,90,90,0.95)";
+    cx.fill();
+    cx.lineWidth = Math.max(1.5, r / 3);
+    cx.strokeStyle = "rgba(0,0,0,0.85)";
+    cx.stroke();
+  });
+}
+
+async function enterClickMode() {
+  const info = S.cfg && S.cfg.interactive;
+  if (!info || !info.available) {
+    setTool("brush");
+    return toast((info && info.reason) || "click-to-segment unavailable", "bad");
+  }
+  if (!S.scene) { setTool("brush"); return toast("load a scene first", "bad"); }
+  S.click.base = S.mask.slice();
+  resetClickSession(true);
+  const on = $("#sel-click-on").value;
+  if (S.click.ready && S.click.on === on) { clickStatus("ready — click the water"); return; }
+  S.click.ready = false;
+  S.click.busy = true;
+  clickStatus(`preparing ${info.model || "SAM2"} for this scene… (one-off, ~20 s on CPU)`, true);
+  showSamOverlay(`Preparing ${info.model || "SAM2"} for this scene — one-off, `
+    + "about 20 s on CPU. Clicks are ignored until it is ready.");
+  const r = await api(`/api/scene/${S.scene.id}/click/prepare`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ on }),
+  });
+  S.click.busy = false;
+  if (!r.ok) { setTool("brush"); clickStatus(""); return toast(r.error || "prepare failed", "bad"); }
+  S.click.ready = true;
+  S.click.on = on;
+  clickStatus(r.cached ? "ready — click the water"
+                       : `ready in ${r.elapsed_s}s — click the water`);
+  bump();
+}
+
+async function samClick(px, negative) {
+  if (S.click.busy) return;              // the overlay/ring already says why
+  if (!S.click.ready) return toast("SAM2 isn't ready for this scene yet", "bad");
+  S.click.pts.push([px.x, px.y]);
+  S.click.labels.push(negative ? 0 : 1);
+  S.click.busy = true;
+  clickStatus("segmenting…", true);
+  showPendingPoint(px, negative);
+  bump();
+  const r = await api(`/api/scene/${S.scene.id}/click`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ on: S.click.on, points: S.click.pts, labels: S.click.labels }),
+  });
+  S.click.busy = false;
+  if (!r.ok) {
+    S.click.pts.pop(); S.click.labels.pop();
+    clickStatus("");
+    return toast(r.error || "click failed", "bad");
+  }
+  S.click.cands = r.candidates || [];
+  S.click.idx = 0;
+  S.click.total = S.click.cands.length;
+  await applyClickCandidate();
+  const alt = S.click.total > 1 ? `  ·  ${S.click.total} candidates (C to cycle)` : "";
+  clickStatus(`${S.click.pts.length} point(s) · ${Math.round(r.elapsed_s * 1000)} ms${alt}`);
+}
+
+/** Union the chosen SAM candidate onto the pre-click mask. */
+async function applyClickCandidate() {
+  const cand = S.click.cands[S.click.idx];
+  if (!cand) return;
+  const img = await cachedImg(cand.url);
+  const c = document.createElement("canvas");
+  c.width = S.W; c.height = S.H;
+  const cx = c.getContext("2d", { willReadFrequently: true });
+  cx.drawImage(img, 0, 0, S.W, S.H);
+  const data = cx.getImageData(0, 0, S.W, S.H).data;
+  const base = S.click.base;
+  for (let i = 0, j = 0; i < S.mask.length; i++, j += 4) {
+    S.mask[i] = (base[i] || data[j] > 127) ? 255 : 0;
+  }
+  S.seedBackend = "sam2:interactive";
+  S.backendParams = { on: S.click.on, n_points: S.click.pts.length };
+  renderMask();
+  restorePreview();
+  $("#decision-hint").textContent =
+    "clicked with SAM2 — add points to refine, then correct with the brush and Save";
+}
+
+function cycleClickCandidate() {
+  if (S.click.total < 2) return;
+  S.click.idx = (S.click.idx + 1) % S.click.total;
+  const c = S.click.cands[S.click.idx];
+  applyClickCandidate().then(() => clickStatus(
+    `candidate ${S.click.idx + 1}/${S.click.total} · ${c.water_pct}% water (C to cycle)`));
+}
+
+function undoClickPoint() {
+  if (!S.click.pts.length) return;
+  S.click.pts.pop(); S.click.labels.pop();
+  if (!S.click.pts.length) {
+    S.mask.set(S.click.base);
+    renderMask();
+    resetClickSession(true);
+    clickStatus("ready — click the water");
+    return;
+  }
+  samClickRerun();
+}
+
+async function samClickRerun() {
+  S.click.busy = true;
+  clickStatus("segmenting…", true);
+  const last = S.click.pts[S.click.pts.length - 1];
+  showPendingPoint({ x: last[0], y: last[1] },
+                   S.click.labels[S.click.labels.length - 1] === 0);
+  const r = await api(`/api/scene/${S.scene.id}/click`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ on: S.click.on, points: S.click.pts, labels: S.click.labels }),
+  });
+  S.click.busy = false;
+  if (!r.ok) { clickStatus(""); return toast(r.error || "click failed", "bad"); }
+  S.click.cands = r.candidates || [];
+  S.click.idx = 0; S.click.total = S.click.cands.length;
+  await applyClickCandidate();
+  clickStatus(`${S.click.pts.length} point(s)`);
+}
+
+/** Bank the current object and start prompting a new one. */
+function newClickObject() {
+  if (!S.scene) return;
+  snapshot();
+  S.click.base = S.mask.slice();
+  resetClickSession(true);
+  restorePreview();
+  clickStatus("new object — click the water");
 }
 
 /* -------------------------------------------------- morphological clean */
@@ -659,6 +981,7 @@ function session() {
     active_seconds: S.activeSeconds,
     n_strokes: S.nStrokes,
     n_undos: S.nUndos,
+    n_clicks: S.click.pts.length,
     seg_mean_entropy: S.segMeta.mean_entropy ?? "",
     seg_low_conf_frac: S.segMeta.low_conf_frac ?? "",
     ensemble_agreement: S.ensemble.agreement ?? "",
@@ -771,26 +1094,35 @@ function wireControls() {
   };
 
   document.querySelectorAll(".tool").forEach((b) => {
-    b.onclick = () => {
-      document.querySelectorAll(".tool").forEach((x) => x.classList.remove("active"));
-      b.classList.add("active");
-      S.tool = b.dataset.tool;
-    };
+    b.onclick = () => setTool(b.dataset.tool);
   });
+  $("#btn-click-new").onclick = newClickObject;
+  $("#btn-click-undo").onclick = undoClickPoint;
+  $("#sel-click-on").onchange = () => {
+    S.click.ready = false;                 // a different view needs a new embedding
+    if (S.tool === "click") enterClickMode();
+  };
+  $("#canvas-wrap").addEventListener("scroll", invalidateRect, { passive: true });
+  window.addEventListener("resize", invalidateRect);
 
   const mk = $("#mask");
   mk.addEventListener("pointerdown", (e) => {
     if (!S.scene) return;
     bump();
+    invalidateRect();                    // one layout read per stroke, not per move
     if (S.spaceHeld || e.button === 1) { S.panning = true; S.last = { x: e.clientX, y: e.clientY }; return; }
     const px = evToPx(e);
+    if (S.tool === "click") { samClick(px, e.shiftKey || e.altKey || e.button === 2); return; }
     if (S.tool === "fill") { floodFill(px); return; }
     S.drawing = true; S.strokeDirty = false;
     snapshot();
     S.last = px;
     stamp(px.x, px.y, S.tool === "erase" ? 0 : 255);
-    renderMask();
+    scheduleRender();
     mk.setPointerCapture(e.pointerId);
+  });
+  mk.addEventListener("contextmenu", (e) => {
+    if (S.tool === "click") e.preventDefault();     // right-click = negative point
   });
   mk.addEventListener("pointermove", (e) => {
     if (S.panning) {
@@ -798,14 +1130,21 @@ function wireControls() {
       w.scrollLeft -= e.clientX - S.last.x;
       w.scrollTop -= e.clientY - S.last.y;
       S.last = { x: e.clientX, y: e.clientY };
+      invalidateRect();
       return;
     }
     if (!S.drawing) return;
     bump();
-    const px = evToPx(e);
-    paintLine(S.last, px, S.tool === "erase" ? 0 : 255);
-    S.last = px;
-    renderMask();
+    // Paint every coalesced sample so fast strokes stay continuous, but
+    // repaint once per frame rather than once per event.
+    const val = S.tool === "erase" ? 0 : 255;
+    const events = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
+    for (const ev of (events.length ? events : [e])) {
+      const px = evToPx(ev);
+      paintLine(S.last, px, val);
+      S.last = px;
+    }
+    scheduleRender();
   });
   const endStroke = () => {
     if (S.drawing && S.strokeDirty) S.nStrokes++;
@@ -822,6 +1161,9 @@ function wireControls() {
     if (k === "b") setTool("brush");
     else if (k === "e") setTool("erase");
     else if (k === "f") setTool("fill");
+    else if (k === "k") setTool("click");
+    else if (k === "c" && S.tool === "click") cycleClickCandidate();
+    else if (k === "n" && S.tool === "click") newClickObject();
     else if (k === "u") undo();
     else if (k === "r") redo();
     else if (k === "[") setBrush(S.brush - 4);
@@ -930,8 +1272,16 @@ async function pollTrain() {
 }
 
 function setTool(t) {
+  const prev = S.tool;
   S.tool = t;
   document.querySelectorAll(".tool").forEach((x) => x.classList.toggle("active", x.dataset.tool === t));
+  $("#click-group").hidden = t !== "click";
+  if (prev === "click" && t !== "click") {   // leaving: bank the object, drop the points
+    resetClickSession(false);
+    restorePreview();
+    clickStatus("");
+  }
+  if (t === "click" && prev !== "click") enterClickMode();
 }
 function setBrush(v) {
   S.brush = Math.max(2, Math.min(120, v));
