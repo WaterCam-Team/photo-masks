@@ -384,7 +384,12 @@ class TrainManager:
             self.run_dir = prev[-1]
             self.phase = "done"
             try:
-                self.cfg = json.loads((self.run_dir / "metrics.json").read_text()).get("args", {})
+                m = json.loads((self.run_dir / "metrics.json").read_text())
+                # "config" since the pipeline moved into training/; "args" is
+                # what runs from before that wrote. Recovering the wrong key
+                # leaves the Train panel blank and makes the ONNX export fall
+                # back to a default --img-size instead of the run's own.
+                self.cfg = m.get("config") or m.get("args", {})
             except Exception:                        # noqa: BLE001
                 pass
 
@@ -1030,8 +1035,11 @@ class Handler(BaseHTTPRequestHandler):
         if not (isinstance(box, (list, tuple)) and len(box) == 4):
             raise ValueError("box must be [x0, y0, x1, y1]")
         x0, y0, x1, y1 = (int(v) for v in box)
-        x0, x1 = sorted((max(0, x0), min(W - 1, x1)))
-        y0, y1 = sorted((max(0, y0), min(H - 1, y1)))
+        x0, x1 = sorted((x0, x1))
+        x0, x1 = max(0, x0), min(W - 1, x1)          # sort first: a reversed box
+                                                     # would otherwise skip a bound
+        y0, y1 = sorted((y0, y1))
+        y0, y1 = max(0, y0), min(H - 1, y1)
         if x1 - x0 < 2 or y1 - y0 < 2:
             raise ValueError("box is too small")
         return [x0, y0, x1, y1]

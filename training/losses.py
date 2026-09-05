@@ -106,13 +106,18 @@ class SegLoss:
             self._w = torch.tensor(self.class_weights, dtype=torch.float32,
                                    device=logits.device)
         aux = [p for p in self.parts if p != "ce"]
-        share = self.aux_w / len(aux) if aux else 0.0
+        has_ce = "ce" in self.parts
+        # the components must sum to 1.0 whatever the spec: with no CE term the
+        # aux losses share the whole weight, not aux_w, or `--loss dice` would
+        # train at half the gradient magnitude of `--loss ce` at the same --lr
+        share = ((self.aux_w if has_ce else 1.0) / len(aux)) if aux else 0.0
         total = None
         for part in self.parts:
             if part == "ce":
                 v = F.cross_entropy(logits, target, weight=self._w,
                                     ignore_index=self.ignore_index)
                 w = self.ce_w if aux else 1.0
+
             elif part == "dice":
                 v, w = dice_loss(logits, target, self.ignore_index), share
             else:

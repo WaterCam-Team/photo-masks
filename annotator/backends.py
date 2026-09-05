@@ -635,7 +635,17 @@ class SegformerOnnxBackend(Backend):
             bands = pre["read"](Path(scene_dir), Path(tiff_path)).astype(np.float32)
         else:
             bands = arr[list(pre["bands"])].copy()
-        if bands.shape[1:] != (H, W):
+        # Match validation's geometry exactly. training/data.py zero-pads a whole
+        # frame up to the model's stride; resizing 972x1296 -> 992x1312 instead
+        # would stretch it ~2% vertically and ~1% horizontally (and would be
+        # asking INTER_AREA to upscale, which it is not for). Padding is only
+        # right for the native-resolution path, so legacy 512x512 checkpoints
+        # keep resizing, which is how they were trained.
+        pad_h, pad_w = (-H0) % 32, (-W0) % 32
+        padded = (not pre["legacy"]) and (H, W) == (H0 + pad_h, W0 + pad_w)
+        if padded:
+            bands = np.pad(bands, ((0, 0), (0, pad_h), (0, pad_w)))
+        elif bands.shape[1:] != (H, W):
             bands = np.stack(
                 [cv2.resize(bands[i], (W, H), interpolation=cv2.INTER_AREA)
                  for i in range(bands.shape[0])], axis=0)
@@ -647,7 +657,8 @@ class SegformerOnnxBackend(Backend):
             return BackendResult(None, error=f"SegFormer inference failed: {e}")
 
         meta: dict = {"preprocessing": pre["label"], "modality": pre["modality"],
-                      "input_hw": [int(H), int(W)]}
+                      "input_hw": [int(H), int(W)],
+                      "geometry": "padded" if padded else "resized"}
         if out.ndim == 3:                            # (C, h, w) logits
             ex = np.exp(out - out.max(axis=0, keepdims=True))
             p = ex / ex.sum(axis=0, keepdims=True)
@@ -659,7 +670,9 @@ class SegformerOnnxBackend(Backend):
             pred = out
 
         water = (pred == self.water_class).astype(np.uint8)
-        if water.shape != (H0, W0):
+        if padded:
+            water = water[:H0, :W0]                  # discard the pad, don't resample
+        elif water.shape != (H0, W0):
             water = cv2.resize(water, (W0, H0), interpolation=cv2.INTER_NEAREST)
         mask = water * 255
         meta["water_pct"] = round(100 * float(water.mean()), 2)

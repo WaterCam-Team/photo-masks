@@ -146,22 +146,30 @@ def paired_markdown(rows: list[dict], baseline: str | None = None) -> str:
     if len(ok) < 2:
         return ""
     base = baseline or max(ok, key=lambda r: r.get("mean_miou") or -1)["modality"]
-    ref = {tuple(f["held_out"]): f["miou"] for f in
+    ref = {tuple(f["held_out"]): f.get("miou") for f in
            next(r for r in ok if r["modality"] == base)["per_fold"]}
     folds = sorted(ref)
 
-    lines = [f"Paired against **{base}**, fold by fold "
-             f"(identical splits and hyperparameters):", "",
-             "| vs | mean Δ mIoU | " + " | ".join(f[0][:22] for f in folds) + " | wins |",
+    lines = [f"Paired per fold against **{base}** "
+             f"(identical splits and hyperparameters). A positive Δ means "
+             f"**{base} scored higher** than the row's modality on that fold:", "",
+             f"| row modality | mean Δ ({base} − row) | "
+             + " | ".join(f[0][:22] for f in folds)
+             + f" | folds {base} wins |",
              "|" + "|".join(["---"] * (len(folds) + 3)) + "|"]
     for r in ok:
         if r["modality"] == base:
             continue
         got = {tuple(f["held_out"]): f["miou"] for f in r["per_fold"]}
-        d = [ref[f] - got[f] for f in folds if got.get(f) is not None]
+        # a fold whose subprocess failed carries miou None on either side; skip
+        # the pair rather than raising at the end of an hours-long sweep
+        usable = [f for f in folds
+                  if ref.get(f) is not None and got.get(f) is not None]
+        d = [ref[f] - got[f] for f in usable]
         if not d:
             continue
-        cells = " | ".join(f"{x:+.3f}" for x in d)
+        cells = " | ".join(f"{(ref[f] - got[f]):+.3f}" if f in usable else "—"
+                           for f in folds)
         lines.append(f"| {r['modality']} | {sum(d)/len(d):+.3f} | {cells} | "
                      f"{sum(1 for x in d if x > 0)}/{len(d)} |")
     return "\n".join(lines)

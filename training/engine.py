@@ -149,9 +149,16 @@ def build_loaders(cfg, stats: BandStats):
     # one would fail; drop it only when there is more than one batch to keep.
     n = len(tr)
     drop_last = n > cfg.batch and n % cfg.batch == 1
+    # persistent_workers is deliberately OFF. Workers get a pickled copy of the
+    # dataset at first-iterator creation, so `tr.set_epoch(ep)` would only ever
+    # mutate the parent's copy and every worker would keep seeding its RNG with
+    # epoch 0 — identical crops, flips and jitter on every epoch, i.e. silently
+    # no augmentation at all on any run with workers > 0 (the GPU default).
+    # Re-forking per epoch costs a fraction of a second; losing augmentation
+    # costs the run.
     dltr = DataLoader(tr, batch_size=cfg.batch, shuffle=True, num_workers=workers,
                       pin_memory=is_cuda, drop_last=drop_last,
-                      persistent_workers=workers > 0)
+                      persistent_workers=False)
     # eval runs whole frames, whose sizes may differ between capture sessions
     dlva = DataLoader(va, batch_size=1, num_workers=workers, pin_memory=is_cuda) \
         if va is not None else None
