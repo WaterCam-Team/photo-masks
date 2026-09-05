@@ -19,8 +19,10 @@ Two selection modes:
       python export_dataset.py --gold-only <dataset_dir> [--label-log PATH]
       Reads the annotator's work/label_log.csv and exports ONLY scenes whose
       latest decision was made by a human:
-          route in {auto_accepted, auto_edited, manual_from_scratch}
-      i.e. an accepted/edited SAM (or other) seed, or a hand-drawn mask.
+          route in {auto_accepted, auto_edited, interactive_clicks,
+                    manual_from_scratch}
+      i.e. an accepted/edited SAM (or other) seed, a SAM2 click session the
+      human steered, or a hand-drawn mask.
       Never falls back to water_mask_auto.png. 'rejected' / unlabelled scenes
       are excluded. Writes dataset_provenance.csv (route, seed_backend,
       auto_vs_final_iou, edited_pixel_frac, active_seconds, annotator, time)
@@ -55,7 +57,8 @@ MANIFEST_NAME = "manifest.csv"
 TIFF_NAMES = ("color_preserved_5_band.tiff", "final_5_band.tiff")
 
 # decisions that mean "a human looked at this mask and kept it"
-GOLD_ROUTES = {"auto_accepted", "auto_edited", "manual_from_scratch"}
+GOLD_ROUTES = {"auto_accepted", "auto_edited", "interactive_clicks",
+               "manual_from_scratch"}
 
 HERE = Path(__file__).resolve().parent
 PROVENANCE_FIELDS = [

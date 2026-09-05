@@ -22,7 +22,8 @@ import numpy as np
 
 LOG_HEADER = [
     "timestamp", "annotator", "scene_id", "scene_dir",
-    "route",                 # auto_accepted | auto_edited | manual_from_scratch | rejected
+    "route",                 # auto_accepted | auto_edited | interactive_clicks
+                             # | manual_from_scratch | rejected | empty
     "seed_backend", "backend_params",
     "auto_water_pct", "final_water_pct",
     "auto_vs_final_iou", "edited_pixel_frac",
@@ -134,9 +135,22 @@ def append_log(log_path: Path, row: dict) -> None:
 
 
 def classify_route(seed_present: bool, n_strokes: int,
-                   iou: float | None, final_has_water: bool) -> str:
+                   iou: float | None, final_has_water: bool,
+                   interactive: bool = False) -> str:
+    """Which labeling route produced this mask — the RL policy's action.
+
+    `interactive_clicks` is its own action rather than a flavour of
+    `auto_edited`: steering SAM2 by hand and accepting a batch backend's
+    proposal have very different costs, and collapsing them would teach the
+    policy that they are interchangeable. How *much* correction followed is
+    already carried quantitatively by n_strokes, auto_vs_final_iou and
+    edited_pixel_frac, so the accepted/edited split stays recoverable without
+    fragmenting a small dataset into more route values.
+    """
     if not seed_present:
         return "manual_from_scratch" if final_has_water else "empty"
+    if interactive:
+        return "interactive_clicks"
     if n_strokes == 0 and iou is not None and iou >= 0.999:
         return "auto_accepted"
     return "auto_edited"

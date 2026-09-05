@@ -67,7 +67,15 @@ const S = {
   click: { ready: false, busy: false, on: null, pts: [], labels: [],
            base: null, cands: [], idx: 0, total: 0,
            pending: null,          // {x,y,neg} point SAM2 is decoding right now
-           pendingAt: 0, pendingTimer: null },
+           pendingAt: 0, pendingTimer: null,
+           // The mask as SAM2 last left it, before any brush correction. This
+           // is the "auto seed" of an interactive session: IoU(seed, final)
+           // then answers "how much did the human fix after SAM2", which is
+           // the quality signal label_log.csv exists to record.
+           seed: null,
+           // monotonic per scene: pts[] is cleared on every tool switch and
+           // every "New object", so its length is 0 in the normal workflow
+           nClicks: 0 },
 };
 
 /* ------------------------------------------------------------------ boot */
@@ -238,6 +246,7 @@ async function loadScene(id) {
   dropTintCache();
   S.waterCount = 0; S.dirty = null; invalidateRect();
   S.click.ready = false; S.click.on = null;      // a new scene needs a new embedding
+  S.click.seed = null; S.click.nClicks = 0;
   resetClickSession(false);
   if (S.tool === "click") setTool("brush");
   clickStatus("");
@@ -666,6 +675,7 @@ async function samClick(px, negative) {
   if (!S.click.ready) return toast("SAM2 isn't ready for this scene yet", "bad");
   S.click.pts.push([px.x, px.y]);
   S.click.labels.push(negative ? 0 : 1);
+  S.click.nClicks++;
   S.click.busy = true;
   clickStatus("segmenting…", true);
   showPendingPoint(px, negative);
@@ -702,6 +712,7 @@ async function applyClickCandidate() {
   for (let i = 0, j = 0; i < S.mask.length; i++, j += 4) {
     S.mask[i] = (base[i] || data[j] > 127) ? 255 : 0;
   }
+  S.click.seed = S.mask.slice();          // SAM2's output, pre-correction
   S.seedBackend = "sam2:interactive";
   S.backendParams = { on: S.click.on, n_points: S.click.pts.length };
   renderMask();
@@ -721,6 +732,7 @@ function cycleClickCandidate() {
 function undoClickPoint() {
   if (!S.click.pts.length) return;
   S.click.pts.pop(); S.click.labels.pop();
+  S.click.nClicks = Math.max(0, S.click.nClicks - 1);
   if (!S.click.pts.length) {
     S.mask.set(S.click.base);
     renderMask();
@@ -960,13 +972,14 @@ async function loadImgToMask(url, asSeed, seedName, params) {
 }
 
 /* -------------------------------------------------------- save / reject */
-function maskToPngDataUrl() {
+function maskToPngDataUrl(src) {
+  const m = src || S.mask;
   const c = document.createElement("canvas");
   c.width = S.W; c.height = S.H;
   const cx = c.getContext("2d");
   const im = cx.createImageData(S.W, S.H);
-  for (let i = 0, j = 0; i < S.mask.length; i++, j += 4) {
-    const v = S.mask[i] ? 255 : 0;
+  for (let i = 0, j = 0; i < m.length; i++, j += 4) {
+    const v = m[i] ? 255 : 0;
     im.data[j] = im.data[j + 1] = im.data[j + 2] = v; im.data[j + 3] = 255;
   }
   cx.putImageData(im, 0, 0);
@@ -981,7 +994,7 @@ function session() {
     active_seconds: S.activeSeconds,
     n_strokes: S.nStrokes,
     n_undos: S.nUndos,
-    n_clicks: S.click.pts.length,
+    n_clicks: S.click.nClicks,
     seg_mean_entropy: S.segMeta.mean_entropy ?? "",
     seg_low_conf_frac: S.segMeta.low_conf_frac ?? "",
     ensemble_agreement: S.ensemble.agreement ?? "",
@@ -995,7 +1008,12 @@ async function save() {
   $("#btn-save").disabled = true;
   const r = await api(`/api/scene/${S.scene.id}/save`, {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ mask_png_b64: maskToPngDataUrl(), session: session() }),
+    body: JSON.stringify({
+      mask_png_b64: maskToPngDataUrl(),
+      // only when SAM2 actually produced something this scene
+      seed_png_b64: S.click.seed ? maskToPngDataUrl(S.click.seed) : undefined,
+      session: session(),
+    }),
   });
   $("#btn-save").disabled = false;
   if (!r.ok) return toast(r.error || "save failed", "bad");

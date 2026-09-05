@@ -150,20 +150,32 @@ trainer. Per-backend override: `backends.<name>.device`.
    order-dependent desyncs the whole review state.
 3. **A missing model/dep disables a backend, never crashes the app.**
 4. **Gold ≠ silver.** `--gold-only` exports only `route ∈ {auto_accepted,
-   auto_edited, manual_from_scratch}`. Never let a pseudo-label into that path.
-5. **`label_log.csv` is append-only** and is the RL dataset. Don't rewrite rows;
+   auto_edited, interactive_clicks, manual_from_scratch}`. Never let a
+   pseudo-label into that path. A new human-verified route must be added to
+   `GOLD_ROUTES` or its scenes silently stop reaching training.
+5. **An interactive SAM2 session posts its own seed.** There is no single
+   auto-mask file to point at — the result is the union of candidates the
+   human steered, composed client-side — so the client posts that composite
+   as `seed_png_b64` and the save records route `interactive_clicks`. Without
+   it the seed lookup fails (`:` is outside its charset, and candidates are
+   written as `_annotator_click_<rank>.png`), the route degrades to
+   `manual_from_scratch`, and `auto_vs_final_iou` / `edited_pixel_frac` are
+   left empty — the RL dataset's whole point. `n_clicks` counts monotonically
+   per scene for the same reason: `click.pts` is cleared on every tool switch
+   and every "New object".
+6. **`label_log.csv` is append-only** and is the RL dataset. Don't rewrite rows;
    add columns at the end of `LOG_HEADER` if you must extend it. The
    `annotator` value comes from the client (the header field, per-browser
    `localStorage`) and is therefore untrusted — always pass it through
    `clean_annotator()`, which falls back to the server's `--annotator`.
-6. **Torch backends hold a `threading.Lock` around inference.** The server is
+7. **Torch backends hold a `threading.Lock` around inference.** The server is
    threaded; a shared torch module is not reentrant.
-7. **Click-to-segment caches ONE embedding, and the key must match.**
+8. **Click-to-segment caches ONE embedding, and the key must match.**
    `InteractiveSam` holds `(scene_id, on)`; `predict()` refuses when the key
    differs rather than decoding a click against the wrong scene's features.
    Encoding is ~15-20 s CPU and decoding ~70-150 ms — that ratio is the whole
    reason the feature is usable, so never re-encode per click.
-8. **A trained checkpoint carries its own preprocessing.** `training/` writes
+9. **A trained checkpoint carries its own preprocessing.** `training/` writes
    `best_hf/norm.json` (modality + per-band statistics) and the `segformer`
    backend reads it, so a served model is normalised exactly as it was
    trained. ONNX export copies it beside the `.onnx` as `<stem>.norm.json`.
@@ -171,7 +183,7 @@ trainer. Per-backend override: `backends.<name>.device`.
    one with it runs at native resolution padded to /32, because that is what
    it was validated on. Never normalise in one place only — that is the bug
    `segformer_5band/PERFORMANCE.md` documented, and it is invisible in tests.
-9. **Splits are assigned per capture session, never per scene.** The rig
+10. **Splits are assigned per capture session, never per scene.** The rig
    fires repeatedly within a session — `20251229-1427`, `-14270`, `-1428`,
    `-1429` are the same view seconds apart. Splitting those individually puts
    near-duplicate frames on both sides and the val score measures
@@ -179,22 +191,22 @@ trainer. Per-backend override: `backends.<name>.device`.
    where a session-grouped split scored ~0.6. `training/manifest.py` groups by
    the scene's parent directory (`--group-by scene` opts out). Anything that
    reassigns splits must keep whole sessions together.
-10. **Two mask encodings are in circulation.** The annotator writes
+11. **Two mask encodings are in circulation.** The annotator writes
    `water_mask.png` as **0/255**; `export_dataset.py` converts to class
    indices **0/1**. Threshold masks at `> 0`, never `> 127` — at 127 every
    exported mask reads as all background: empty labels, no error, a model
    that predicts nothing. `training/engine.py` refuses to train on a split
    whose measured water fraction is 0.
-11. **Painting repaints a dirty rect, not the frame.** `stamp()` marks the
+12. **Painting repaints a dirty rect, not the frame.** `stamp()` marks the
    region it touched and maintains `S.waterCount` incrementally;
    `scheduleRender()` coalesces to one `putImageData` per animation frame over
    just that rect. Anything that replaces `S.mask` wholesale (undo, fill,
    clean, load, SAM) must call `renderMask()`, which recounts and repaints in
    full. Getting this wrong leaves stale pixels or a drifting water %.
-12. **A replicate scene is served blind.** If `blind_for()` is true, the
+13. **A replicate scene is served blind.** If `blind_for()` is true, the
    `/api/scene/<id>` response must not list `water_mask.png` and the sidebar
    must not flag `has_manual` — an anchored second opinion is not evidence.
-13. **`#preview` is read-only.** The canvas stack is `#bg` (1) → `#preview` (2)
+14. **`#preview` is read-only.** The canvas stack is `#bg` (1) → `#preview` (2)
    → `#mask` (3). Hover-previews and the disagreement map draw to `#preview`
    and must never write `S.mask` — previewing has to stay non-destructive.
    `#preview` has `pointer-events: none` so it can't swallow brush strokes.

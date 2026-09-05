@@ -1216,7 +1216,20 @@ class Handler(BaseHTTPRequestHandler):
         sess = data.get("session", {})
         seed_backend = sess.get("seed_backend")
         seed = None
-        if seed_backend and re.fullmatch(r"[A-Za-z0-9._-]+", str(seed_backend)):
+
+        # An interactive SAM2 session has no single auto-mask file to point at:
+        # the result is the union of the candidates the human steered, composed
+        # client-side. The client therefore posts that composite as the seed --
+        # the mask as SAM2 left it, before any brush correction. Without this
+        # the lookup below fails (":" is not in its charset, and the candidates
+        # are written as _annotator_click_<rank>.png), the route degrades to
+        # manual_from_scratch, and auto_vs_final_iou / edited_pixel_frac -- the
+        # quality signal this log exists to record -- are left empty.
+        interactive = False
+        if data.get("seed_png_b64"):
+            seed = decode_mask_png(data["seed_png_b64"], hw)
+            interactive = True
+        elif seed_backend and re.fullmatch(r"[A-Za-z0-9._-]+", str(seed_backend)):
             cdir = app.cache_dir(scene["id"])
             for cand in (cdir / f"_annotator_auto_{seed_backend}.png",
                          cdir / str(seed_backend),          # e.g. _annotator_ensemble.png
@@ -1233,7 +1246,8 @@ class Handler(BaseHTTPRequestHandler):
         edited = rlf.edited_fraction(seed, final)
         final_pct = round(100 * float((final > 0).mean()), 3)
         auto_pct = round(100 * float((seed > 0).mean()), 3) if seed is not None else None
-        route = rlf.classify_route(seed is not None, n_strokes, iou, (final > 0).any())
+        route = rlf.classify_route(seed is not None, n_strokes, iou,
+                                   (final > 0).any(), interactive)
 
         with app.lock:
             from PIL import Image
