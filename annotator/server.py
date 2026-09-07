@@ -503,16 +503,40 @@ class TrainManager:
             "info": [e.get("msg") for e in ev if e.get("event") in ("info", "warn")][-5:],
         }
 
-    def export_onnx(self, onnx_out: Path) -> dict:
+    def export_onnx(self, out_dir: Path, int8: bool = True) -> dict:
         if not self.run_dir or not (self.run_dir / "best_hf").exists():
             return {"ok": False, "error": "no finished run with a checkpoint"}
-        cmd = [sys.executable, str(HERE / "trainer.py"), "--export-onnx",
-               str(self.run_dir / "best_hf"), "--onnx-out", str(onnx_out),
-               "--img-size", str(self.cfg.get("img_size", 512))]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
-        return {"ok": r.returncode == 0,
-                "path": str(onnx_out) if r.returncode == 0 and onnx_out.exists() else None,
-                "log": (r.stdout + r.stderr)[-1500:]}
+        # fail here with a fixable message rather than inside the subprocess
+        import importlib.util as _iu
+        missing = [m for m in ("onnx", "onnxruntime") if _iu.find_spec(m) is None]
+        if missing:
+            return {"ok": False, "info": {"error":
+                    f"deployment export needs {' and '.join(missing)} — run "
+                    f"`uv sync --group export` (onnx is only needed to export, "
+                    f"not to train)"}}
+        cmd = [sys.executable, str(HERE / "trainer.py"), "--export-pi",
+               str(self.run_dir / "best_hf"), "--out-dir", str(out_dir),
+               "--img-size", str(self.cfg.get("img_size", 512)),
+               "--calib", str(self.dataset_dir)]
+        if not int8:
+            cmd.append("--no-int8")
+        # INT8 calibration runs the model once per scene, so allow real time
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+        info = {}
+        for line in (r.stdout or "").splitlines():   # the last deploy event wins
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                if ev.get("event") == "deploy":
+                    info = {k: v for k, v in ev.items() if k != "event"}
+                elif ev.get("event") == "error":
+                    info.setdefault("error", ev.get("msg"))
+        return {"ok": r.returncode == 0 and bool(info.get("files")),
+                "dir": str(out_dir), "info": info,
+                "log": (r.stdout + r.stderr)[-2000:]}
 
 
 class App:
@@ -989,7 +1013,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"ok": True, "model": str(tr.run_dir / "best_hf"),
                                "backend": app.registry["segformer"].info()})
         if p == "/api/train/export-onnx":
-            return self._json(app.trainer.export_onnx(HERE / "weights" / "segformer_5band.onnx"))
+            body = self._body_json() or {}
+            return self._json(app.trainer.export_onnx(
+                HERE / "weights", int8=bool(body.get("int8", True))))
 
         return self._err(404, "not found")
 

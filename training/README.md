@@ -245,3 +245,48 @@ and a model that predicts nothing.
 * ONNX export covers SegFormer only (opset 17 — 13 fails on
   `scaled_dot_product_attention` in `transformers` 5.x) and needs
   `uv sync --group export`.
+
+## Deploying to the camera nodes
+
+Export writes `annotator/weights/segformer_5band.onnx` (the Train panel's
+"Export for deployment" hard-codes that path), plus `<stem>.norm.json`.
+
+**Normalisation is compiled into the graph.** The exported model takes raw
+resized bands in 0–255 units and normalises them itself, and the graph is
+stamped with metadata (`normalization`, `input_range`, `norm_mean`,
+`norm_std`, `modality`, `bands`) readable through onnxruntime's
+`custom_metadata_map`. `SU-WaterCam/tools/segformer_preprocess.py` reads that
+and skips its own normalisation. Before this, it always applied per-band
+min–max: on a mean/std-trained model that produced **99.7% of the frame called
+water** against 52.4% correct, silently. `--no-embed-norm` exports the legacy
+contract (pre-normalised input); the Pi then reads the statistics from the
+metadata instead.
+
+**The Train panel's "Export for deployment" builds the node bundle directly** —
+no second pass with a different script on the Pi:
+
+```
+segformer_5band_fp32.onnx    benchmark baseline          (15.1 MB)
+segformer_5band_int8.onnx    what the node runs           (4.6 MB)
+segformer_5band_prep.onnx    quantization intermediate
+deploy.json                  what these are, and the checks that were run
+```
+
+INT8 static quantization (per-channel, QDQ) is calibrated on your labelled
+scenes, because "representative data" means the exact preprocessing the graph
+sees in the field — raw 0–255 bands, since normalisation is compiled in.
+Quantization is lossy and silent, so the bundle is verified against its own
+full-precision twin and the agreement lands in `deploy.json` (0.9953 pixel
+agreement, 0.9915 water IoU on the current model) rather than being assumed.
+
+Per `SU-WaterCam/docs/SEGFORMER_OPTIMIZATION.md`, B0 at 512² is ~10–18 s fp32
+and ~4–7 s INT8 on a Pi 4B — an **estimate extrapolated from Cortex-A72
+benchmarks, not a measurement**. On x86 INT8 measured slightly *slower* than
+fp32 here, which is normal for QDQ without VNNI; time it on a node before
+believing the speedup. B0 is already the right variant — that document calls
+using B0 "the single highest-impact change for inference speed".
+
+Copy the directory to `/home/pi/segformer_5band/` and
+`SU-WaterCam/tools/segformer_daemon.py` picks it up. `--export-onnx` still
+produces a single fp32 file for other consumers; the CLI is
+`python trainer.py --export-pi <hf_dir> --out-dir <dir> [--no-int8] [--calib …]`.

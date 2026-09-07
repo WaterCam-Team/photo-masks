@@ -33,12 +33,14 @@ dependencies = [
 sam = ["ultralytics"]                                  # `sam` / `sam2` backends (pulls torch)
 train = ["transformers>=4.40", "torch", "accelerate"]  # `segformer` backend + ⚙ Train panel
 onnx = ["onnxruntime"]                                 # run a .onnx in the `segformer` backend
-export = ["onnx"]                                      # "Export for deployment"
+export = ["onnx"]                                      # "Export for deployment":
+                                                       # builds the camera-node
+                                                       # bundle (fp32 + INT8)
 tinysam = ["timm"]                                     # `tinysam` backend (+ TinySAM repo/weights)
 
 [tool.uv]
 package = false
-default-groups = ["sam", "train", "onnx"]
+default-groups = ["sam", "train", "onnx", "export"]
 
 # ultralytics pulls in plain `opencv-python`, which installs into the SAME cv2
 # package directory as our `opencv-contrib-python-headless` — whichever lands

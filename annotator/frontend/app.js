@@ -1247,11 +1247,111 @@ function wireTrain() {
     await loadConfig();
   };
   $("#tp-onnx").onclick = async () => {
-    $("#tp-onnx-msg").textContent = "exporting ONNX…";
-    const r = await api("/api/train/export-onnx", { method: "POST" });
-    $("#tp-onnx-msg").textContent = r.ok ? "ONNX: " + r.path
-      : (r.log || "").split("\n").filter(Boolean).slice(-1)[0] || "export failed";
+    const int8 = $("#tp-int8").checked;
+    $("#tp-onnx").disabled = true;
+    $("#tp-deploy").hidden = true;
+    $("#tp-onnx-msg").textContent = int8
+      ? "building bundle — quantizing and calibrating on your labelled scenes…"
+      : "exporting full-precision model…";
+    const r = await api("/api/train/export-onnx", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ int8 }),
+    });
+    $("#tp-onnx").disabled = false;
+    if (!r.ok) {
+      $("#tp-onnx-msg").textContent =
+        (r.info && r.info.error) ||
+        (r.log || "").split("\n").filter(Boolean).slice(-1)[0] || "export failed";
+      return;
+    }
+    $("#tp-onnx-msg").textContent = "";
+    renderDeploy(r);
   };
+}
+
+/* What was actually built. The point of showing this is that "exported a
+   model" hides the two things that decide whether it is shippable: which file
+   the node runs (INT8, not the full-precision twin), and how much the
+   quantization changed the mask. */
+function renderDeploy(r) {
+  const box = $("#tp-deploy");
+  const i = r.info || {};
+  const files = i.files || {}, sz = i.sizes_mb || {};
+  const el = (t, cls, txt) => {
+    const n = document.createElement(t);
+    if (cls) n.className = cls;
+    if (txt !== undefined) n.textContent = txt;
+    return n;
+  };
+  box.innerHTML = "";
+
+  const head = el("div", "dep-head");
+  head.append(el("b", null, "Deployment bundle"),
+              el("span", "muted", `${i.arch || "model"} · ${i.modality || ""} · `
+                 + `${i.in_channels ?? "?"} band(s) · `
+                 + `${(i.input && i.input.size || []).join("×") || "512×512"}`));
+  box.appendChild(head);
+
+  const shipping = files.int8 || files.fp32;
+  for (const [kind, name] of [["int8", files.int8], ["fp32", files.fp32]]) {
+    if (!name) continue;
+    const row = el("div", "dep-file");
+    const ship = name === shipping;
+    row.append(el("b", null, name),
+               el("span", "sz", sz[kind] != null ? `${sz[kind]} MB` : ""),
+               el("span", "tag " + (ship ? "ship" : "ref"),
+                  ship ? "runs on the node" : "reference / benchmark"));
+    box.appendChild(row);
+  }
+
+  const dl = el("dl");
+  const add = (k, v) => { dl.append(el("dt", null, k), el("dd", null, v)); };
+  if (i.input) {
+    add("input", `${i.input.units === "raw_0_255"
+      ? "raw bands, 0–255 — the graph normalises itself"
+      : "pre-normalised"} (${i.input.normalization || "?"})`);
+  }
+  const v = i.int8_vs_fp32;
+  if (v) {
+    add("INT8 vs full precision",
+        `${(v.pixel_agreement * 100).toFixed(2)}% of pixels agree, `
+        + `water IoU ${v.water_iou} over ${v.scenes} scene(s)`);
+  }
+  if (i.calibration_scenes != null) add("calibrated on", `${i.calibration_scenes} labelled scene(s)`);
+  const est = i.pi4b_estimate_s;
+  if (est) {
+    add("Pi 4B, per frame (estimate)", files.int8
+      ? `~${est.int8[0]}–${est.int8[1]} s (INT8) · ~${est.fp32[0]}–${est.fp32[1]} s (fp32)`
+      : `~${est.fp32[0]}–${est.fp32[1]} s (fp32) — INT8 would be ~${est.int8[0]}–${est.int8[1]} s`);
+  }
+  // Shown because it is measured, and because it is easy to misread: INT8 is
+  // often no faster on x86, where the speedup relies on instructions the Pi
+  // does not have either. The ARM figures above are an estimate, not a
+  // measurement — time it on a node before believing them.
+  if (v && v.host_ms_fp32) {
+    add("this machine (not a node)",
+        `${v.host_ms_fp32} ms fp32` + (v.host_ms_int8 ? ` · ${v.host_ms_int8} ms INT8` : ""));
+  }
+  box.appendChild(dl);
+
+  box.append(el("div", "muted", "copy to " + (i.deploy_to || "the node") + " :"));
+  box.appendChild(el("div", "dep-path", r.dir || ""));
+
+  if (v && v.pixel_agreement < 0.98) {
+    box.appendChild(el("div", "dep-warn",
+      "⚠ Quantization changed more than 2% of pixels. Check a mask before "
+      + "shipping, or export without INT8."));
+  }
+  if (!files.int8) {
+    box.appendChild(el("div", "dep-warn",
+      "⚠ Full-precision only — " + (typeof i.int8 === "string" ? i.int8 : "INT8 skipped")
+      + ". The node will run roughly 2.5× slower."));
+  }
+  if (i.calibration_scenes === 0 || i.calibration_scenes == null && files.int8) {
+    box.appendChild(el("div", "dep-warn",
+      "⚠ No calibration scenes were used, so the INT8 ranges are guesses."));
+  }
+  box.hidden = false;
 }
 
 async function pollTrain() {

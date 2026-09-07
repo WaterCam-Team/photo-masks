@@ -223,3 +223,24 @@ header #btn-train { margin-left: 8px; padding: 4px 10px; min-height: 28px; }
   #sam-pending::before { opacity: 1; transform: scale(1); }
   #sam-pending::after  { display: none; }
 }
+
+/* deployment bundle summary: what was built, and is it safe to ship */
+.tp-deploy { border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px;
+  background: #0d1117; font-size: 12px; display: flex; flex-direction: column; gap: 6px; }
+.tp-deploy[hidden] { display: none; }
+.tp-deploy .dep-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.tp-deploy .dep-file { display: flex; align-items: baseline; gap: 8px;
+  font-family: ui-monospace, monospace; }
+.tp-deploy .dep-file b { color: var(--ink); }
+.tp-deploy .dep-file .sz { color: var(--muted); }
+.tp-deploy .dep-file .tag { font-size: 10px; padding: 1px 6px; border-radius: 10px;
+  text-transform: uppercase; letter-spacing: .4px; }
+.tp-deploy .tag.ship { background: #17331f; color: var(--ok); }
+.tp-deploy .tag.ref  { background: #30363d; color: var(--muted); }
+.tp-deploy .dep-path { font-family: ui-monospace, monospace; color: #cfe4ff;
+  word-break: break-all; }
+.tp-deploy .dep-warn { color: var(--warn); }
+.tp-deploy dl { display: grid; grid-template-columns: max-content 1fr; gap: 2px 10px;
+  margin: 0; color: var(--muted); }
+.tp-deploy dt { color: var(--muted); }
+.tp-deploy dd { margin: 0; color: var(--ink); }

@@ -60,9 +60,12 @@
       <button id="tp-use" class="accent"
               title="Add the model you just trained to the auto-segmenter list, so it can pre-label the next scenes for you">3 · Use this model for auto-segmenting</button>
       <button id="tp-onnx"
-              title="Export the trained model in the format the camera nodes run">Export for deployment</button>
-      <span id="tp-onnx-msg" class="muted"></span>
+              title="Build the camera-node bundle: an INT8-quantized model plus its full-precision twin, calibrated on your labelled scenes. Ready to copy to a Pi.">Export for deployment</button>
+      <label title="INT8 runs about 2.5x faster on a Pi 4B but is quantized, so it is checked against the full-precision model and the agreement is reported.">
+        <input type="checkbox" id="tp-int8" checked> quantize to INT8</label>
+      <span id="tp-onnx-msg" class="muted" role="status"></span>
     </div>
+    <div id="tp-deploy" class="tp-deploy" hidden></div>
     <div id="tp-note" class="muted">
       CPU training is slow (~1 min/epoch on a small set). It keeps running if you close this panel.
       A hand-labelled val set gives the only trustworthy mIoU.

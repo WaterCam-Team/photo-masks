@@ -47,7 +47,44 @@ from training.engine import emit, train              # noqa: E402
 from training.train import RunConfig                 # noqa: E402
 
 
-def export_onnx(hf_dir: str, onnx_out: str, img_size: int = 512) -> None:
+def export_pi(hf_dir: str, out_dir: str, img_size: int = 512, int8: bool = True,
+              calib: str | None = None, n_calib: int = 32) -> None:
+    """Build the camera-node bundle: fp32 + INT8 + deploy.json, ready to copy.
+
+    Calibration uses real captures — by default the gold dataset the Train
+    panel exported, which is the same distribution the node will see.
+    """
+    from training import deploy
+
+    hf = Path(hf_dir)
+    norm_src = hf / "norm.json"
+    if not norm_src.exists():
+        emit(event="error", msg=f"no norm.json in {hf} — this checkpoint predates "
+                                f"band statistics; retrain, or export with "
+                                f"--export-onnx for the legacy contract")
+        sys.exit(1)
+    stats = ST.BandStats.from_json(norm_src)
+
+    rows: list[dict] = []
+    src = Path(calib) if calib else (HERE / "work" / "dataset")
+    if src.is_file():                                   # a manifest
+        from training import manifest as mf
+        rows = mf.load(src, split="train")
+    elif src.exists():                                  # an img_dir/ann_dir tree
+        rows = D.legacy_rows(src).get("train", [])
+    if not rows:
+        emit(event="warn", msg=f"no calibration scenes under {src} — INT8 ranges "
+                               f"will come from whatever the quantizer guesses")
+    rows = rows[:n_calib]
+
+    arch = "segformer-b0"
+    info = deploy.build(hf, Path(out_dir), stats, rows, arch=arch,
+                        size=img_size, int8=int8, emit=emit)
+    emit(event="deploy", **info)
+
+
+def export_onnx(hf_dir: str, onnx_out: str, img_size: int = 512,
+                no_embed_norm: bool = False) -> None:
     """Export a trained HF checkpoint for the camera nodes.
 
     `norm.json` is copied next to the .onnx: the deployed runtime needs the
@@ -66,8 +103,10 @@ def export_onnx(hf_dir: str, onnx_out: str, img_size: int = 512) -> None:
                                f"normalised per-image (legacy min-max)")
     arch = "segformer-b0"
     m = models.load(arch, str(hf), in_channels=channels)
+    stats = ST.BandStats.from_json(norm_src) if norm_src.exists() else None
     try:
-        out = m.export_onnx(Path(onnx_out), size=img_size)
+        out = m.export_onnx(Path(onnx_out), size=img_size, stats=stats,
+                            embed_norm=not no_embed_norm)
     except Exception as e:                          # noqa: BLE001
         msg = str(e)
         low = msg.lower()
@@ -116,13 +155,31 @@ def main():
     ap.add_argument("--eval-every", type=int, default=1, help="epochs between val")
     ap.add_argument("--export-onnx", metavar="HF_DIR",
                     help="skip training: export this HF model dir to ONNX")
+    ap.add_argument("--export-pi", metavar="HF_DIR",
+                    help="skip training: build the camera-node bundle (fp32 + "
+                         "INT8 + deploy.json) from this HF model dir")
+    ap.add_argument("--out-dir", default=None, help="where --export-pi writes")
+    ap.add_argument("--no-int8", action="store_true",
+                    help="--export-pi: fp32 only, skip quantization")
+    ap.add_argument("--calib", default=None,
+                    help="--export-pi: calibration scenes — a training.manifest CSV "
+                         "or an img_dir/ann_dir tree (default: work/dataset)")
+    ap.add_argument("--n-calib", type=int, default=32,
+                    help="--export-pi: how many scenes to calibrate on")
     ap.add_argument("--onnx-out", default=None)
+    ap.add_argument("--no-embed-norm", action="store_true",
+                    help="export a graph that expects pre-normalised input "
+                         "(the legacy contract) instead of normalising inside it")
     args = ap.parse_args()
 
     try:
+        if args.export_pi:
+            export_pi(args.export_pi, args.out_dir or str(HERE / "weights"),
+                      args.img_size, not args.no_int8, args.calib, args.n_calib)
+            return
         if args.export_onnx:
             export_onnx(args.export_onnx, args.onnx_out or "segformer_5band.onnx",
-                        args.img_size)
+                        args.img_size, args.no_embed_norm)
             return
         if not (args.data_root or args.manifest) or not args.out:
             ap.error("--out plus one of --data-root / --manifest is required")

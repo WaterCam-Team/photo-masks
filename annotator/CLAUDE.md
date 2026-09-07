@@ -183,6 +183,11 @@ trainer. Per-backend override: `backends.<name>.device`.
    one with it runs at native resolution padded to /32, because that is what
    it was validated on. Never normalise in one place only — that is the bug
    `segformer_5band/PERFORMANCE.md` documented, and it is invisible in tests.
+   For deployment the normalisation is compiled **into** the ONNX graph and
+   the graph is stamped with metadata describing it; `SU-WaterCam`'s
+   `segformer_preprocess.py` reads that rather than assuming min-max. Feeding
+   a mean/std-trained model min-max input measured 99.7% of the frame as
+   water, with no error raised.
 10. **Splits are assigned per capture session, never per scene.** The rig
    fires repeatedly within a session — `20251229-1427`, `-14270`, `-1428`,
    `-1429` are the same view seconds apart. Splitting those individually puts
