@@ -248,7 +248,6 @@ async function loadScene(id) {
   S.click.ready = false; S.click.on = null;      // a new scene needs a new embedding
   S.click.seed = null; S.click.nClicks = 0;
   resetClickSession(false);
-  if (S.tool === "click") setTool("brush");
   clickStatus("");
   $("#ensemble-panel").hidden = true;
   $("#ens-legend").hidden = true;
@@ -283,6 +282,10 @@ async function loadScene(id) {
   refreshScenes();
   $("#backend-status").textContent = "";
   $("#decision-hint").textContent = "";
+  // Click mode is sticky across scenes: the server keeps the SAM2 weights
+  // loaded, so start encoding this scene now rather than making the labeller
+  // re-select the tool and wait. After the saved-mask load, so it is the base.
+  if (S.tool === "click") enterClickMode();
 }
 
 async function drawBackground() {
@@ -657,10 +660,15 @@ async function enterClickMode() {
   clickStatus(`preparing ${info.model || "SAM2"} for this scene… (one-off, ~20 s on CPU)`, true);
   showSamOverlay(`Preparing ${info.model || "SAM2"} for this scene — one-off, `
     + "about 20 s on CPU. Clicks are ignored until it is ready.");
-  const r = await api(`/api/scene/${S.scene.id}/click/prepare`, {
+  const sid = S.scene.id;
+  const r = await api(`/api/scene/${sid}/click/prepare`, {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ on }),
   });
+  // The labeller moved on while this encoded (next scene, other tool, other
+  // view) — whoever is current owns S.click now, so don't mark it ready.
+  if (!S.scene || S.scene.id !== sid || S.tool !== "click"
+      || $("#sel-click-on").value !== on) return;
   S.click.busy = false;
   if (!r.ok) { setTool("brush"); clickStatus(""); return toast(r.error || "prepare failed", "bad"); }
   S.click.ready = true;

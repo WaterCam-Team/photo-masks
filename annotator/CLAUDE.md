@@ -175,6 +175,10 @@ trainer. Per-backend override: `backends.<name>.device`.
    differs rather than decoding a click against the wrong scene's features.
    Encoding is ~15-20 s CPU and decoding ~70-150 ms — that ratio is the whole
    reason the feature is usable, so never re-encode per click.
+   The Click tool is sticky across scenes: `loadScene()` re-runs
+   `enterClickMode()` so the next scene starts encoding on load (the weights
+   stay resident in `_pred`; only the embedding is per-scene). A prepare that
+   returns after the user moved on is discarded client-side.
 9. **A trained checkpoint carries its own preprocessing.** `training/` writes
    `best_hf/norm.json` (modality + per-band statistics) and the `segformer`
    backend reads it, so a served model is normalised exactly as it was
