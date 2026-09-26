@@ -11,14 +11,22 @@ loop, and an exporter that emits MMSeg-format datasets with a provenance trail.
 
 ## The 5-band input
 
-One `color_preserved_5_band.tiff` (or `final_5_band.tiff`) per scene directory,
-uint8, typically 1296×972:
+One `color_preserved_5_band.tiff` per scene directory, uint8, typically
+1296×972:
 
 | band (1-based) | content |
 |---|---|
-| 1, 2, 3 | R, G, B (optical) |
+| 1, 2, 3 | **R, G, B** (optical) |
 | 4 | Thermal / LWIR, normalised to 0–255 |
 | 5 | NIR difference (NIR-ON frame minus NIR-OFF frame) |
+
+Co-registration also writes `final_5_band.tiff`, and **the two are not the same
+image**: `final_5_band` is **B, G, R**, thermal, NIR at a squashed 512×512,
+because it carries OpenCV's native channel order straight from `cv2.imread`.
+Everything in this repo reads `color_preserved`. Feeding a model the other file
+swaps red and blue and nothing raises — the shape is right, the mask looks like
+a mask, and the water is in the wrong place. `SU-WaterCam/docs/CAPTURE_PIPELINE_NOTES.md`
+is the canonical table.
 
 Water absorbs NIR, so band 5 is the primary cue — but it does **not** separate
 water from snow, which is why a human stays in the loop.
