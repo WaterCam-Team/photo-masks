@@ -20,7 +20,9 @@ class SegformerWrapper(SegModel):
         from transformers import SegformerConfig, SegformerForSemanticSegmentation
 
         if from_checkpoint:
-            m = SegformerForSemanticSegmentation.from_pretrained(self.init)
+            m, load = SegformerForSemanticSegmentation.from_pretrained(
+                self.init, output_loading_info=True)
+            self._check_loaded(load)
             got = m.config.num_channels
             if got != self.in_channels:
                 raise ValueError(
@@ -46,6 +48,43 @@ class SegformerWrapper(SegModel):
         m.config.num_channels = self.in_channels        # so save/load round-trips
         return m
 
+    @staticmethod
+    def _check_loaded(load: dict) -> None:
+        """Refuse a checkpoint whose weights did not actually load.
+
+        `from_pretrained` treats a key it cannot place as a note, not an error:
+        it randomly initialises the parameter and returns a model that runs.
+        Export that and the .onnx has correct metadata, a correct output shape
+        and a decode head full of noise — nothing downstream can see it, only
+        the mask can, in the field.
+
+        The live case is the decode-head projections, which `transformers`
+        renamed between `decode_head.linear_c.*` and
+        `decode_head.linear_projections.*`. The newer version maps the old
+        names on load; the older one does not, so a checkpoint the annotator's
+        own environment reads perfectly loads as noise under an older
+        `transformers` elsewhere on the machine.
+        """
+        missing = [k for k in load.get("missing_keys") or ()
+                   if not k.endswith((".num_batches_tracked",))]
+        if not missing:
+            return
+        unexpected = list(load.get("unexpected_keys") or ())
+        names = ("linear_c", "linear_projections")
+        renamed = any(a in k for k in missing for a in names) and \
+            any(b in k for k in unexpected for b in names)
+        if renamed:
+            import transformers
+            hint = (f" — this `transformers` ({transformers.__version__}) cannot "
+                    f"read the decode-head key names the checkpoint was written "
+                    f"with. Load it from the environment that trained it "
+                    f"(`annotator/.venv`), or retrain there.")
+        else:
+            hint = " — the checkpoint does not match this architecture."
+        raise ValueError(
+            f"{len(missing)} weight(s) would be randomly initialised instead of "
+            f"loaded, e.g. {', '.join(missing[:3])}{hint}")
+
     def scores(self, x):
         import torch.nn.functional as F
         lo = self.module(pixel_values=x).logits
@@ -55,8 +94,9 @@ class SegformerWrapper(SegModel):
         return loss_fn(self.scores(x), y)
 
     def export_onnx(self, onnx_out: Path, size: int = 512, opset: int = 17,
-                    stats=None, embed_norm: bool = True) -> Path:
-        """Export for the camera nodes: fixed CHW, dynamic batch, bilinear-upsampled.
+                    stats=None, embed_norm: bool = True,
+                    dynamic_hw: bool = True) -> Path:
+        """Export for the camera nodes: dynamic H/W, dynamic batch, bilinear-upsampled.
 
         Opset 17, not 13: SegFormer attention in `transformers` 5.x lowers to
         `aten::scaled_dot_product_attention`, which the exporter only supports
@@ -73,6 +113,13 @@ class SegformerWrapper(SegModel):
 
         Per-image `minmax` cannot be embedded — it depends on the image, not on
         the model — so that one stays external and is declared as such.
+
+        Height and width are dynamic axes by default. A graph frozen at
+        `size x size` forces `SU-WaterCam/tools/segformer_daemon.py` down its
+        static-shape branch, which resizes the 4:3 capture (972x1296) to a
+        square and squashes it; with dynamic H/W the daemon keeps the aspect
+        ratio, pads to a multiple of 32, and crops the padding back off.
+        `size` still sets the shape the graph is traced and INT8-calibrated at.
         """
         import torch
 
@@ -115,14 +162,16 @@ class SegformerWrapper(SegModel):
             wrap = Wrap(self.module)
 
         dummy = torch.zeros(1, self.in_channels, size, size)
+        axes = {0: "n", 2: "h", 3: "w"} if dynamic_hw else {0: "n"}
         torch.onnx.export(wrap, dummy, str(onnx_out),
                           input_names=["input"], output_names=["logits"],
                           opset_version=opset, dynamo=False,
-                          dynamic_axes={"input": {0: "n"}, "logits": {0: "n"}})
-        self._stamp(onnx_out, stats, embed)
+                          dynamic_axes={"input": dict(axes), "logits": dict(axes)})
+        self._stamp(onnx_out, stats, embed, dynamic_hw, size)
         return onnx_out
 
-    def _stamp(self, onnx_out: Path, stats, embed: bool) -> None:
+    def _stamp(self, onnx_out: Path, stats, embed: bool,
+               dynamic_hw: bool = True, size: int = 512) -> None:
         """Record in the graph what preprocessing it expects.
 
         `onnxruntime` exposes these as
@@ -139,6 +188,8 @@ class SegformerWrapper(SegModel):
             "in_channels": str(self.in_channels),
             "num_classes": str(self.num_classes),
             "input_layout": "NCHW",
+            "input_hw": "dynamic" if dynamic_hw else f"{size},{size}",
+            "trained_size": str(size),
             "input_range": "raw_0_255" if embed else "normalised",
             "normalization": ("embedded:" + stats.method) if embed
             else ("external:" + (getattr(stats, "method", None) or "minmax")),

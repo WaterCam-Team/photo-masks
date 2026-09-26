@@ -83,7 +83,7 @@ class _CalibrationReader:
 
 def build(hf_dir: Path, out_dir: Path, stats, calib_rows: list[dict],
           arch: str = "segformer-b0", size: int = 512, int8: bool = True,
-          emit=None) -> dict:
+          emit=None, dynamic_hw: bool = True) -> dict:
     """Export fp32 (+INT8) for the camera nodes and describe what was made."""
     import onnxruntime as ort
 
@@ -97,7 +97,8 @@ def build(hf_dir: Path, out_dir: Path, stats, calib_rows: list[dict],
 
     m = models.load(arch, str(hf_dir), in_channels=stats.channels)
     t0 = time.time()
-    m.export_onnx(fp32, size=size, stats=stats, embed_norm=True)
+    m.export_onnx(fp32, size=size, stats=stats, embed_norm=True,
+                  dynamic_hw=dynamic_hw)
     emit(event="info", msg=f"fp32 graph -> {fp32.name} "
                            f"({fp32.stat().st_size / 1e6:.1f} MB, {time.time()-t0:.1f}s)")
 
@@ -107,7 +108,9 @@ def build(hf_dir: Path, out_dir: Path, stats, calib_rows: list[dict],
         "modality": stats.modality,
         "bands": stats.band_names,
         "in_channels": stats.channels,
-        "input": {"layout": "NCHW", "size": [size, size], "units": "raw_0_255",
+        "input": {"layout": "NCHW",
+                  "size": "dynamic" if dynamic_hw else [size, size],
+                  "trained_size": [size, size], "units": "raw_0_255",
                   "normalization": f"embedded:{stats.method}"},
         "files": {"fp32": fp32.name},
         "sizes_mb": {"fp32": round(fp32.stat().st_size / 1e6, 2)},
@@ -164,8 +167,45 @@ def build(hf_dir: Path, out_dir: Path, stats, calib_rows: list[dict],
     info["sizes_mb"]["int8"] = round(int8_path.stat().st_size / 1e6, 2)
     info["calibration_scenes"] = len(calib_rows)
     info.update(verify(fp32, int8_path, calib_rows, stats.modality, size, emit))
+    if dynamic_hw:
+        info["accepts_node_shape"] = {
+            k: _accepts_node_shape(v, stats.channels, emit)
+            for k, v in (("fp32", fp32), ("int8", int8_path))}
     (out_dir / "deploy.json").write_text(json.dumps(info, indent=2))
     return info
+
+
+#: What `SU-WaterCam/tools/segformer_daemon.py` actually feeds a dynamic graph:
+#: a 972x1296 capture rescaled keeping its aspect ratio to img_scale (1024,512),
+#: giving 512x683, then padded up to the next multiple of 32.
+NODE_HW = (512, 704)
+
+
+def _accepts_node_shape(onnx_path: Path, channels: int, emit=None) -> bool:
+    """Does this graph run at the non-square shape the node feeds it?
+
+    A graph frozen at size x size loads and infers happily — on square input.
+    The failure only appears on the node, where the frame is 4:3, so it is
+    worth one forward pass here rather than a support call from the field.
+    """
+    import onnxruntime as ort
+
+    emit = emit or (lambda **kw: None)
+    h, w = NODE_HW
+    try:
+        s = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+        y = s.run(None, {s.get_inputs()[0].name:
+                         np.zeros((1, channels, h, w), np.float32)})[0]
+    except Exception as e:                            # noqa: BLE001
+        emit(event="warn", msg=f"{onnx_path.name} rejects the node's {h}x{w} input "
+                               f"— the daemon will squash the 4:3 frame: {e}")
+        return False
+    if y.shape[-2:] != (h, w):
+        emit(event="warn", msg=f"{onnx_path.name} returned {y.shape[-2:]} for a "
+                               f"{h}x{w} input")
+        return False
+    emit(event="info", msg=f"{onnx_path.name} accepts the node's {h}x{w} input")
+    return True
 
 
 def verify(fp32: Path, int8_path: Path, rows: list[dict], modality: str,
