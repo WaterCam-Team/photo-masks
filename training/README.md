@@ -135,7 +135,10 @@ More sessions, not more epochs, is what would settle it.
 Every modality is sampled on the co-registered grid of
 `color_preserved_5_band.tiff` — the grid the gold masks are drawn on. Band
 provenance was **measured**, not assumed (`modalities.verify_provenance()`
-re-checks it on any scene):
+re-checks it on any scene). Band numbers in this table are **0-based** into the
+`color_preserved_5_band.tiff` band stack — `R, G, B, THERMAL, NIR = 0, 1, 2, 3, 4`,
+as `modalities.py` defines them. `photo_processing/README.md` and
+`coreg/README.md` number the same bands 1-based:
 
 | modality | ch | source | measured |
 |---|---|---|---|
