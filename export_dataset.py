@@ -74,9 +74,21 @@ PROVENANCE_FIELDS = [
 # ---------------------------------------------------------------------------
 
 def find_tiff(scene_dir: Path) -> Path | None:
+    """The scene's five-band TIFF, preferring color_preserved.
+
+    The fallback is not interchangeable. color_preserved_5_band.tiff is
+    R,G,B,thermal,NIR at the native 4:3 frame; final_5_band.tiff is
+    B,G,R,thermal,NIR squashed to 512x512. Exporting a mixture would put two
+    channel conventions in one training set, which no model can learn its way
+    out of, so the fallback says so loudly rather than quietly succeeding.
+    """
     for n in TIFF_NAMES:
         p = scene_dir / n
         if p.exists():
+            if n != TIFF_NAMES[0]:
+                print(f"  WARNING: {scene_dir.name} has no {TIFF_NAMES[0]}; falling back to {n}, "
+                      f"which is BGR at 512x512 rather than RGB at full resolution. "
+                      f"Re-run co-registration for this scene instead of training on it.")
             return p
     return None
 
