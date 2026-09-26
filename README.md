@@ -28,6 +28,11 @@ swaps red and blue and nothing raises — the shape is right, the mask looks lik
 a mask, and the water is in the wrong place. `SU-WaterCam/docs/CAPTURE_PIPELINE_NOTES.md`
 is the canonical table.
 
+Captures made from 2026-09-26 on state their own order in a `BAND_ORDER` TIFF
+tag (`red,green,blue,thermal,nir`), in the same format the exported `.onnx`
+declares, so file and model can be compared without interpreting prose. Older
+captures carry only the band descriptions and are read by keyword.
+
 Water absorbs NIR, so band 5 is the primary cue — but it does **not** separate
 water from snow, which is why a human stays in the loop.
 
