@@ -30,6 +30,7 @@ from pathlib import Path
 
 import numpy as np
 
+from . import classes as CL
 from . import modalities as M
 
 #: how a Normalizer maps raw uint8 counts to model input
@@ -53,6 +54,10 @@ class BandStats:
     n_pixels: int
     water_frac: float
     band_names: list[str]
+    #: Pixel fraction per class, indexed as `training/classes.CLASS_NAMES`.
+    #: Defaulted so a `norm.json` written before the four-class taxonomy still
+    #: loads; `water_frac` is kept for the same reason and stays the binary view.
+    class_frac: list[float] | None = None
 
     def to_json(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -69,15 +74,26 @@ class BandStats:
                          [0.0] * channels, [255.0] * channels, 0.02, 0.98,
                          0, 0, 0.5, list(M.BAND_NAMES[:channels]))
 
-    def class_weights(self, cap: float = 5.0) -> list[float]:
-        """Inverse-frequency weights [background, water], clipped.
+    def class_weights(self, cap: float = 5.0, num_classes: int = 2) -> list[float]:
+        """Inverse-frequency weights per class, clipped.
 
-        Water covers roughly 40-60% of these frames, so this is usually near
-        [1,1] — it matters for the single-band modalities and for sessions
-        with only a puddle in view.
+        Water covers roughly 40-60% of these frames, so the binary case is
+        usually near [1,1] — it matters for the single-band modalities and for
+        sessions with only a puddle in view. It matters far more for the
+        four-class taxonomy, where snow_ice and wet_ground are rare enough that
+        unweighted cross-entropy would let the model ignore them entirely and
+        still score well.
+
+        Falls back to the binary form when `class_frac` is absent, so a
+        checkpoint from before the taxonomy keeps the weights it trained with.
         """
-        w = max(min(self.water_frac, 0.999), 1e-3)
-        raw = [0.5 / (1.0 - w), 0.5 / w]
+        if not self.class_frac:
+            w = max(min(self.water_frac, 0.999), 1e-3)
+            raw = [0.5 / (1.0 - w), 0.5 / w]
+            return [float(min(v, cap)) for v in raw]
+        fr = CL.collapse_fracs(self.class_frac, num_classes)
+        n = len(fr)
+        raw = [(1.0 / n) / max(f, 1e-3) for f in fr]
         return [float(min(v, cap)) for v in raw]
 
 
@@ -117,17 +133,26 @@ def accumulate(rows: list[dict], modality: str, lo_q: float = 0.02,
     """One streaming pass over the scenes in `rows` (manifest dicts)."""
     import cv2
 
+    from .data import read_mask                  # local: data imports stats
+
     m = M.get(modality)
     hist = np.zeros((m.channels, 256), np.int64)
+    n_classes = len(CL.CLASS_NAMES)
+    counts = np.zeros(n_classes, np.int64)
     water = total = 0
     for r in rows:
         x = M.read_modality(m, Path(r["tiff_path"]), Path(r["scene_dir"]))
         for c in range(m.channels):
             hist[c] += np.bincount(x[c].ravel(), minlength=256)
-        msk = cv2.imread(str(r["mask_path"]), cv2.IMREAD_GRAYSCALE)
+        try:
+            msk = read_mask(Path(r["mask_path"]))   # decodes all three encodings
+        except FileNotFoundError:
+            msk = None
         if msk is not None:
-            water += int((msk > 0).sum())      # 0/255 and 0/1 masks both, see data.read_mask
-            total += int(msk.size)
+            valid = msk[msk != CL.IGNORE]
+            counts += np.bincount(valid, minlength=n_classes)[:n_classes]
+            water += int((valid == CL.WATER).sum())
+            total += int(valid.size)
 
     n = hist[0].sum()
     if n == 0:
@@ -151,6 +176,7 @@ def accumulate(rows: list[dict], modality: str, lo_q: float = 0.02,
         lo_q=lo_q, hi_q=hi_q, n_scenes=len(rows), n_pixels=int(n),
         water_frac=round(water / total, 6) if total else 0.5,
         band_names=[M.BAND_NAMES[b] for b in m.bands],
+        class_frac=([round(float(c) / total, 6) for c in counts] if total else None),
     )
 
 
@@ -164,6 +190,9 @@ def main():
                     help=f"one of: {', '.join(M.MODALITIES)}, or 'all'")
     ap.add_argument("--split", default="train", help="which split to measure (never val/test)")
     ap.add_argument("--method", default="meanstd", choices=METHODS)
+    ap.add_argument("--num-classes", type=int, default=2,
+                    help="how many classes the model will have; weights are "
+                         "collapsed to match (labelling is always four-class)")
     ap.add_argument("--out-dir", type=Path, default=Path("annotator/work/norm"))
     a = ap.parse_args()
 
@@ -174,7 +203,7 @@ def main():
         out = a.out_dir / f"{name}.json"
         st.to_json(out)
         print(f"{name:12s} n={st.n_scenes} water={st.water_frac:.3f} "
-              f"weights={[round(w, 2) for w in st.class_weights()]} -> {out}")
+              f"weights={[round(w, 2) for w in st.class_weights(num_classes=a.num_classes)]} -> {out}")
         for i, bn in enumerate(st.band_names):
             print(f"    {bn:8s} mean={st.mean[i]:7.2f} std={st.std[i]:6.2f} "
                   f"p{int(st.lo_q*100)}={st.p_lo[i]:5.0f} p{int(st.hi_q*100)}={st.p_hi[i]:5.0f}")

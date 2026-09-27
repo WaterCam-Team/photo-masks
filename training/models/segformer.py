@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from ..classes import CLASS_NAMES as _CLASS_NAMES
 from .base import SegModel
 
 
@@ -187,6 +188,11 @@ class SegformerWrapper(SegModel):
             "arch": self.arch,
             "in_channels": str(self.in_channels),
             "num_classes": str(self.num_classes),
+            # Which index means what. Same comma-separated form as `bands`, so a
+            # runtime can read the taxonomy off the graph instead of assuming
+            # index 1 is water. Truncated to num_classes because a binary model
+            # exported from the four-class taxonomy really does only have two.
+            "classes": ",".join(_CLASS_NAMES[:self.num_classes]),
             "input_layout": "NCHW",
             "input_hw": "dynamic" if dynamic_hw else f"{size},{size}",
             "trained_size": str(size),
