@@ -29,6 +29,17 @@ from pathlib import Path
 import numpy as np
 
 from . import modalities as M
+from .classes import CLASS_NAMES as _CLASS_NAMES
+
+
+def _num_classes(hf_dir) -> int:
+    """How many classes the checkpoint actually has, from its own config."""
+    import json as _json
+    try:
+        cfg = _json.loads((Path(hf_dir) / "config.json").read_text())
+        return int(cfg.get("num_labels") or len(cfg.get("id2label") or {}) or 2)
+    except Exception:                                 # noqa: BLE001
+        return 2
 
 FP32_NAME = "segformer_5band_fp32.onnx"
 INT8_NAME = "segformer_5band_int8.onnx"
@@ -107,6 +118,7 @@ def build(hf_dir: Path, out_dir: Path, stats, calib_rows: list[dict],
         "arch": arch,
         "modality": stats.modality,
         "bands": stats.band_names,
+        "classes": list(_CLASS_NAMES[:_num_classes(hf_dir)]),
         "in_channels": stats.channels,
         "input": {"layout": "NCHW",
                   "size": "dynamic" if dynamic_hw else [size, size],

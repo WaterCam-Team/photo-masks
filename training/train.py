@@ -23,6 +23,7 @@ from pathlib import Path
 
 from . import data as D
 from . import manifest as mf
+from . import classes as CL
 from . import models
 from . import modalities as M
 from . import stats as ST
@@ -107,6 +108,9 @@ def add_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--fold", type=int, default=None,
                     help="k-fold CV: this fold is val, the others train")
     ap.add_argument("--out", type=Path, default=d.out)
+    ap.add_argument("--num-classes", type=int, default=d.num_classes,
+                    help=f"label classes ({', '.join(CL.CLASS_NAMES)}); 2 keeps the "
+                         f"binary water/background model")
     ap.add_argument("--arch", default=d.arch, choices=models.ARCHS)
     ap.add_argument("--modality", default=d.modality, choices=list(M.MODALITIES))
     ap.add_argument("--init", default=None, help="HF id or checkpoint dir (default: "
@@ -150,6 +154,7 @@ def add_args(ap: argparse.ArgumentParser) -> None:
 def config_from_args(a) -> RunConfig:
     cfg = RunConfig(
         out=a.out, arch=a.arch, modality=a.modality, init=a.init,
+        num_classes=a.num_classes,
         crop=a.crop, scale_range=(a.scale_min, a.scale_max),
         eval_long_side=a.eval_long_side, photometric=not a.no_photometric,
         cache=not a.no_cache, epochs=a.epochs, lr=a.lr, batch=a.batch, accum=a.accum,

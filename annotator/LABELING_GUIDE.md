@@ -1,7 +1,7 @@
 # UFONet Water Labeling Guide
 
-**Version:** 0.1 (DRAFT — decisions marked `[DECIDE]` need your sign-off)
-**Last updated:** 2026-09-01
+**Version:** 0.2 — four-class taxonomy decided 2026-09-27
+**Last updated:** 2026-09-27
 **Applies to:** masks produced by `photo_processing/annotator/`, exported via
 `export_dataset.py --gold-only`, used to fine-tune the 5-band SegFormer.
 
@@ -27,13 +27,35 @@ surface damp", not "is this H₂O in any form". Every rule below follows from th
 
 ## Classes
 
+**Decided 2026-09-27. Four classes.** Canonical definition lives in
+`photo_processing/training/classes.py` — this table and that module must agree.
+
 | value | class | meaning |
 |---|---|---|
-| `0` | background | everything else, including sky |
+| `0` | background | everything else: sky, vegetation, buildings, dry ground |
 | `1` | water | standing or flowing water on/over the ground surface |
+| `2` | snow_ice | snow, ice, frozen surface |
+| `3` | wet_ground | wet pavement or soil, dark sheen, no visible depth |
+| `255` | *ignore* | outside the frame after a warp; excluded from the loss |
 
-Binary, 2-class. The annotator paints `1`; `export_dataset.py` writes
-single-channel PNGs with exactly these values.
+**Why snow and wet ground are their own classes rather than background.** They
+are the two things a water detector actually gets wrong. NIR separates them
+physically — water absorbs it, snow reflects it — so a 5-band model *can* learn
+the distinction, but only if the labels draw it. Folded into one background
+alongside sky and buildings, the signal that justifies carrying the NIR band is
+thrown away.
+
+**The deployed node stays binary.** `classes.deploy_binary()` collapses
+everything except water back to background, and `segformer_daemon.py` does the
+same using the `classes` metadata the ONNX carries. So the mask a node
+transmits is unchanged and the 228-byte LoRa bitmap keeps its one bit per
+pixel. The extra classes are training signal, not output.
+
+**Masks labelled before this decision are binary** (`0`/`255`, 255 = water).
+They still load — `training/data.py` detects the encoding — and read as
+background/water. They are *coarse*, not wrong: their background contains
+unlabelled snow and wet ground. Re-label a scene to teach the model the
+difference.
 
 ---
 
@@ -44,9 +66,9 @@ starting point to react to, not a fait accompli.
 
 | # | Case | Call | Rationale |
 |---|---|---|---|
-| 1 | **Snow / ice, frozen surface** | `[DECIDE]` **background** | The node exists to detect flood hazard; frozen surfaces aren't one, and NIR physically separates them (snow reflects, water absorbs) so the model *can* learn the distinction. Counter-argument: a hydrology framing would call a frozen pond "water". If you want that, it should be a **third class**, not merged — merging destroys the NIR signal that makes 5-band worth having. |
+| 1 | **Snow / ice, frozen surface** | **`snow_ice` (2)** — decided 2026-09-27 | Not a flood hazard, so not water; but not background either. NIR separates snow from water physically, and giving it its own class keeps that signal instead of burying it. Collapses to background when the model is deployed binary. |
 | 2 | **Partially frozen — open water next to ice** | label the open water only | The waterline moves; this is exactly the transition a flood camera should track. |
-| 3 | **Wet pavement / dark sheen, no depth** | `[DECIDE]` **background** | "Wet" vs "flooded" is *the* operational distinction. If damp asphalt counts as water, every rainy scene is 60% water and the class stops meaning anything. |
+| 3 | **Wet pavement / dark sheen, no depth** | **`wet_ground` (3)** — decided 2026-09-27 | "Wet" vs "flooded" is *the* operational distinction: if damp asphalt counted as water, every rainy scene would be 60% water and the class would stop meaning anything. Labelling it explicitly teaches the boundary rather than hoping the model infers it. Collapses to background when deployed binary. |
 | 4 | **Standing water on pavement (visible puddle, reflection, depth)** | **water** | This is the flood signal. |
 | 5 | **Sky reflected on a water surface** | **water** | Those pixels *are* water; they just happen to be specular. Excluding them punches holes in every calm-water mask. |
 | 6 | **Shadowed water** | **water** | Illumination doesn't change class. |
@@ -58,7 +80,7 @@ starting point to react to, not a fait accompli.
 | 12 | **Distant water (far shore, horizon)** | **water** | The class is "is this water". Range/usability is the georeferencing pipeline's job, not the segmenter's — don't bake an arbitrary distance cut into the labels. |
 | 13 | **Water in containers** (bottle, bucket, birdbath) | **background** | Not ground-surface water; rare enough that including it only adds confusion. |
 | 14 | **Very small blobs** | **background** if < ~20 px area **or** < ~2 px thick | Below the model's effective resolution at 512²; adds label noise and drags boundary metrics down for no gain. |
-| 15 | **Thin sheet flow across pavement** | `[DECIDE]` **water** if you can see it, subject to rule 14 | This is early-flood signal and worth catching — but it's also the case the spectral backends miss most, so expect to draw it by hand. |
+| 15 | **Thin sheet flow across pavement** | **water (1)** if you can see it, subject to rule 14 — decided 2026-09-27 | Early-flood signal and worth catching. It is the case the spectral backends miss most, so expect to draw it by hand. The line against rule 3: visible *flow or depth* is water, a damp sheen with neither is `wet_ground`. |
 
 ---
 

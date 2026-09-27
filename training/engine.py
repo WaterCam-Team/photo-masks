@@ -139,8 +139,10 @@ def build_loaders(cfg, stats: BandStats):
     geom = Geometry(crop=cfg.crop, scale_range=tuple(cfg.scale_range),
                     eval_long_side=cfg.eval_long_side)
     tr = SceneDataset(cfg.train_rows, cfg.modality, norm, geom, train=True,
+                      num_classes=cfg.num_classes,
                       photometric=cfg.photometric, cache=cfg.cache, seed=cfg.seed)
     va = SceneDataset(cfg.val_rows, cfg.modality, norm, geom, train=False,
+                      num_classes=cfg.num_classes,
                       cache=cfg.cache) if cfg.val_rows else None
 
     is_cuda = cfg.device.startswith("cuda")
@@ -203,7 +205,7 @@ def train(cfg) -> dict:
 
     model = models.build(cfg.arch, in_channels=in_ch, num_classes=cfg.num_classes,
                          init=cfg.init, emit=emit).to(cfg.device)
-    weights = stats.class_weights() if cfg.class_weights else None
+    weights = stats.class_weights(num_classes=cfg.num_classes) if cfg.class_weights else None
     loss_fn = SegLoss(cfg.loss, weights)
     if not model.supports_pixel_loss and cfg.loss != "ce":
         emit(event="warn", msg=f"{cfg.arch} trains with its own mask-matching loss; "
@@ -329,7 +331,7 @@ def train(cfg) -> dict:
         from torch.utils.data import DataLoader
         te = SceneDataset(cfg.test_rows, cfg.modality, Normalizer(stats, cfg.norm_method),
                           Geometry(eval_long_side=cfg.eval_long_side), train=False,
-                          cache=cfg.cache)
+                          cache=cfg.cache, num_classes=cfg.num_classes)
         if (out / "best.pt").exists():
             model.load_state_dict(torch.load(out / "best.pt", map_location=cfg.device))
         met, per = evaluate(model, DataLoader(te, batch_size=1), cfg.device,

@@ -27,6 +27,7 @@ from pathlib import Path
 
 import numpy as np
 
+from . import classes as CL
 from . import modalities as M
 from .stats import Normalizer
 
@@ -39,19 +40,41 @@ except Exception:                                   # noqa: BLE001 - torch impor
 
 
 def read_mask(path: Path) -> np.ndarray:
-    """Binary water mask -> (H,W) uint8 in {0,1}.
+    """Label mask -> (H,W) uint8 of class indices, with IGNORE preserved.
 
-    `> 0`, not `> 127`, because two mask encodings are in circulation and both
-    must read correctly: the annotator writes `water_mask.png` as 0/255, while
-    `export_dataset.py` converts to class indices 0/1 for its img_dir/ann_dir
-    tree. Thresholding at 127 reads every exported mask as entirely
-    background — empty labels, no error, a model that predicts nothing.
+    Three encodings are in circulation and all must read correctly:
+
+      * **legacy binary**, values in {0, 255} — the annotator's `water_mask.png`
+        before the four-class taxonomy. 255 means water.
+      * **legacy indices**, values in {0, 1} — what `export_dataset.py` writes
+        into its img_dir/ann_dir tree. 1 means water.
+      * **multi-class indices**, values in 0..N-1 plus `IGNORE` (255) — the
+        current encoding, see `training/classes.py`.
+
+    The ambiguity that has to be resolved is 255, which means *water* in the
+    first encoding and *ignore* in the third. A mask whose values are a subset
+    of {0, 255} is read as legacy binary; anything else is read as indices. A
+    multi-class mask always carries at least one index in 1..N-1, so the two
+    cases cannot collide in practice.
+
+    Getting this wrong is silent either way: read a legacy mask as indices and
+    every water pixel becomes "ignore", so the model trains on background only
+    and predicts nothing. Threshold an exported 0/1 mask at 127 and it reads as
+    entirely background, with the same result.
+
+    Legacy binary masks say nothing about *which* negative a background pixel
+    is — they predate snow_ice and wet_ground. They are read as background,
+    which is right for the majority of the frame (sky, trees, buildings) and
+    coarse for the rest. Re-label a scene to teach the model the difference.
     """
     import cv2
     m = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
     if m is None:
         raise FileNotFoundError(path)
-    return (m > 0).astype(np.uint8)
+    present = np.unique(m)
+    if np.isin(present, (0, 255)).all():              # legacy binary: 255 = water
+        return (m > 0).astype(np.uint8)
+    return m.astype(np.uint8)                          # indices, IGNORE passes through
 
 
 def _resize(x: np.ndarray, hw: tuple[int, int], nearest: bool = False) -> np.ndarray:
@@ -111,8 +134,12 @@ class SceneDataset(_TorchDataset):
 
     def __init__(self, rows: list[dict], modality: str, norm: Normalizer,
                  geom: Geometry | None = None, train: bool = True,
-                 photometric: bool = True, cache: bool = True, seed: int = 0):
+                 photometric: bool = True, cache: bool = True, seed: int = 0,
+                 num_classes: int = 2):
         self.rows = list(rows)
+        #: Labelling is four-class; the model may be binary. Masks are
+        #: collapsed into this many classes on read — see classes.collapse.
+        self.num_classes = num_classes
         self.modality = modality
         self.m = M.get(modality)
         self.norm = norm
@@ -135,7 +162,7 @@ class SceneDataset(_TorchDataset):
             return self._cache[i]
         r = self.rows[i]
         x = M.read_modality(self.m, Path(r["tiff_path"]), Path(r["scene_dir"]))
-        y = read_mask(Path(r["mask_path"]))
+        y = CL.collapse(read_mask(Path(r["mask_path"])), self.num_classes)
         if x.shape[1:] != y.shape:
             raise ValueError(f"{r['stem']}: mask {y.shape} does not match image "
                              f"{x.shape[1:]} — mask must be on the TIFF grid")
