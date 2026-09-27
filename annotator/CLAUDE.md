@@ -165,9 +165,25 @@ trainer. Per-backend override: `backends.<name>.device`.
    and every "New object".
 6. **`label_log.csv` is append-only** and is the RL dataset. Don't rewrite rows;
    add columns at the end of `LOG_HEADER` if you must extend it. The
+   `append_log()` rewrites a stale header line (a strict prefix of
+   `LOG_HEADER`) before appending, because rows written under a newer schema
+   are otherwise filed under DictReader's `None` key; that happened to
+   `n_clicks`/`mask_path` for 36 rows until 2026-09-27. Rows whose timing is
+   not a measurement are listed in `work/log_exclusions.csv` (scope
+   `timing`), never deleted; read costs through `rlf.timing_rows()`, which
+   applies it. Their masks stay gold. The
    `annotator` value comes from the client (the header field, per-browser
    `localStorage`) and is therefore untrusted — always pass it through
    `clean_annotator()`, which falls back to the server's `--annotator`.
+6a. **`seg_mean_entropy` / `seg_low_conf_frac` are computed by the server
+   on every save and reject** (`App.seg_uncertainty()`), with whatever model
+   the `segformer` backend is serving, cached in
+   `work/cache/<id>/seg_uncertainty.json` per model, and `seg_model` records
+   which. The client's copy is ignored: it only existed when the human seeded
+   from segformer, which left both columns empty in all early rows. Check what
+   the backend is serving: `_autofind` takes the newest run by mtime, and a
+   run whose best checkpoint is epoch 0 (e.g. `verify-32-venv`) gives
+   entropy ~ln 2 everywhere, i.e. noise.
 7. **Torch backends hold a `threading.Lock` around inference.** The server is
    threaded; a shared torch module is not reentrant.
 8. **Click-to-segment caches ONE embedding, and the key must match.**
@@ -221,6 +237,31 @@ trainer. Per-backend override: `backends.<name>.device`.
    `#preview` has `pointer-events: none` so it can't swallow brush strokes.
 
 ---
+
+## 6b. The label taxonomy
+
+Four classes, decided 2026-09-27: `background 0, water 1, snow_ice 2,
+wet_ground 3`, plus `255` for ignore. Defined **once** in
+`training/classes.py`; the server reads it from there and hands it to the UI on
+`/api/config`. Do not restate it in JavaScript or in a second Python constant.
+
+* `S.mask` in `frontend/app.js` holds **class indices**, not `0/255`. The
+  number key equals the stored index by design.
+* The client encodes the index into R, G and B at alpha 255. That survives the
+  canvas round trip exactly; `server.decode_label_png` reads one channel and
+  does **not** threshold. `decode_mask_png` still exists and still thresholds —
+  it is for seeds, which are binary by nature.
+* Save writes `label_mask.png` (indices) **and** `water_mask.png` (binary
+  water). Every route, IoU and edited-fraction number is computed on the binary
+  view, because those questions are about water and a seed backend only ever
+  proposes water.
+* `training/data.read_mask` prefers `label_mask.png` when it sits beside the
+  `water_mask.png` a manifest points at, then `classes.collapse()` folds the
+  extra classes into background for a binary model.
+* Binary operators must not be handed a four-class mask. `morph()` and
+  `fillHoles()` read any non-zero index as "set" and write 255, which would
+  merge all three foreground classes into one blob — `clean()` therefore
+  extracts one class to a binary plane and merges it back.
 
 ## 7. Gotchas discovered the hard way
 

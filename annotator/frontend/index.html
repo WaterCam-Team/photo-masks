@@ -124,11 +124,15 @@
         <button id="btn-load" title="Load the selected mask into the editor">Load</button>
       </div>
 
+      <div class="group classes">
+        <span class="lbl" title="What the brush paints. The number key is also the value stored in the mask.">Label</span>
+        <span id="class-picker"></span>
+      </div>
       <div class="group tools">
         <button data-tool="brush" class="tool active"
-                title="Paint water onto the photo. Shortcut: B">Brush</button>
+                title="Paint the selected label onto the photo. Shortcut: B">Brush<i id="brush-dot"></i></button>
         <button data-tool="erase" class="tool"
-                title="Remove water you painted by mistake. Shortcut: E">Erase</button>
+                title="Erase back to background. Shortcut: E (or 0)">Erase</button>
         <button data-tool="fill"  class="tool"
                 title="Click an area to fill everything of a similar brightness — good for a whole pond at once. Shortcut: F">Fill</button>
         <button data-tool="click" class="tool"
@@ -201,7 +205,8 @@
     </div>
 
     <div class="footer">
-      <div class="stat" title="Share of the photo currently painted as water">Water: <b id="water-pct">–</b></div>
+      <div class="stat" title="Share of the photo currently painted as water. This is the number the node detects and the RL reward is computed on.">Water: <b id="water-pct">–</b></div>
+      <div class="stat" id="class-counts" title="Share painted as each of the other labels"></div>
       <div class="stat" id="decision-hint" role="status"></div>
       <div class="spacer"></div>
       <button id="btn-reject" class="danger"

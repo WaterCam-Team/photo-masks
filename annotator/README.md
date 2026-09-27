@@ -151,6 +151,42 @@ defaults to `anon` — set one of them.
 If a scanned root has a `manifest.csv` (written by `pipeline.py`), the tool
 keeps its `review_status` / `mask_path` columns in sync.
 
+## Labels — four classes
+
+| key | class | paints | what it means |
+|---|---|---|---|
+| `1` | water | blue | standing or flowing water on/over the ground — the flood signal |
+| `2` | snow_ice | yellow | snow, ice, frozen surface |
+| `3` | wet_ground | vermillion | wet pavement or soil, dark sheen, **no visible depth** |
+| `0` | *(eraser)* | — | back to background |
+
+The number key is the value stored in the mask, so the shortcut and the label
+cannot drift apart. The vocabulary comes from `training/classes.py` via
+`/api/config` — it is not written down in the JavaScript.
+
+`LABELING_GUIDE.md` has the decision table. The line that matters most in
+practice: **visible flow or depth is water; a damp sheen with neither is
+`wet_ground`.**
+
+Saving writes two files:
+
+* `label_mask.png` — class indices, the four-class truth.
+* `water_mask.png` — binary 0/255, water only. Everything that predates the
+  taxonomy still reads this, so adopting four classes breaks nothing.
+
+Masks labelled before the taxonomy are binary and still load; they read as
+background/water. They are *coarse*, not wrong — their background contains
+unlabelled snow and wet ground.
+
+**Snow and wet ground are training signal, not node output.** The deployed
+model collapses everything but water back to background, so what a node
+transmits is unchanged. They exist because they are the two things a water
+detector actually gets wrong, and NIR separates them physically.
+
+Tools act on the selected class: the brush paints it, Fill fills it, and Clean
+tidies that class alone and leaves the others where they are. Backends (SAM2,
+NIR, thermal) detect *water*, so their output always lands in the water class.
+
 ## Creating a mask — walkthrough
 
 A "mask" is a black-and-white picture the same size as the photo: **white where

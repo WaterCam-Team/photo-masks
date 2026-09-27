@@ -57,6 +57,19 @@ HERE = Path(__file__).resolve().parent
 FRONTEND = HERE / "frontend"
 REPO_ROOT = HERE.parent                           # .../photo_processing
 
+if str(REPO_ROOT) not in sys.path:                # so `training` imports as a package
+    sys.path.insert(0, str(REPO_ROOT))
+
+# The label taxonomy is defined once, in training/classes.py, and read from
+# there rather than restated here or in the JavaScript. A second copy is a
+# second thing to forget to update.
+from training.classes import (                    # noqa: E402
+    CLASS_NAMES,
+    IGNORE as IGNORE_LABEL,
+    PALETTE as CLASS_PALETTE,
+    WATER as WATER_INDEX,
+)
+
 # ---------------------------------------------------------------------------
 # configuration
 # ---------------------------------------------------------------------------
@@ -160,7 +173,8 @@ CONTESTED_ALPHA_MIN, CONTESTED_ALPHA_MAX = 18, 215
 
 # on-disk masks the UI offers to load as a starting point
 EXISTING_MASKS = [
-    ("water_mask.png", "manual (saved)"),
+    ("label_mask.png", "manual (saved, 4-class)"),
+    ("water_mask.png", "manual (saved, water only)"),
     ("water_mask_auto.png", "NIR auto"),
     ("water_mask_thermal.png", "thermal auto"),
     ("tinysam_water_mask.png", "TinySAM"),
@@ -354,6 +368,28 @@ def decode_mask_png(b64: str, size_hw: tuple[int, int]) -> np.ndarray:
     if m.shape != size_hw:
         m = cv2.resize(m, (size_hw[1], size_hw[0]), interpolation=cv2.INTER_NEAREST)
     return (m > 127).astype(np.uint8) * 255
+
+
+def decode_label_png(b64: str, size_hw: tuple[int, int]) -> np.ndarray:
+    """Client label PNG -> (H,W) uint8 of class indices.
+
+    The client writes the class index into R, G and B with alpha 255, which
+    survives the canvas round trip exactly — there is no premultiplication loss
+    at full alpha and PNG is lossless. Deliberately *not* thresholded: index 2
+    and 3 are snow_ice and wet_ground, and `> 127` would erase both.
+
+    Resized nearest-neighbour, never interpolated: averaging class indices
+    invents classes that were never painted.
+    """
+    import cv2
+    from PIL import Image
+    raw = base64.b64decode(b64.split(",", 1)[-1])
+    im = Image.open(io.BytesIO(raw)).convert("L")
+    m = np.array(im)
+    if m.shape != size_hw:
+        m = cv2.resize(m, (size_hw[1], size_hw[0]), interpolation=cv2.INTER_NEAREST)
+    n = len(CLASS_NAMES)
+    return np.where(m < n, m, 0).astype(np.uint8)
 
 
 # ===========================================================================
@@ -840,6 +876,11 @@ class Handler(BaseHTTPRequestHandler):
                 "annotator": app.annotator,
                 "backends": [b.info() for b in app.registry.values()],
                 "layers": ["rgb", "false", "nir", "thermal", "ndwi"],
+                # The taxonomy is defined once, in training/classes.py, and
+                # handed to the UI rather than duplicated in JavaScript.
+                "classes": [{"index": i, "name": n, "rgb": list(CLASS_PALETTE[n])}
+                            for i, n in enumerate(CLASS_NAMES)],
+                "water_class": WATER_INDEX,
                 "n_scenes": len(app.scenes),
                 "config_file": str(app.config_path) if app.config_path else None,
                 "roots": [str(r) for r in app.roots],
@@ -1237,7 +1278,14 @@ class Handler(BaseHTTPRequestHandler):
 
         if not data.get("mask_png_b64"):
             return self._err(400, "missing mask_png_b64")
-        final = decode_mask_png(data["mask_png_b64"], hw)
+
+        # The client posts class indices. `labels` is the four-class truth;
+        # `final` is the binary water view of it, which is what every route,
+        # IoU and edited-fraction number below compares — those questions are
+        # about water, and a seed backend only ever proposes water. Deriving
+        # one from the other keeps the two in step by construction.
+        labels = decode_label_png(data["mask_png_b64"], hw)
+        final = (labels == WATER_INDEX).astype(np.uint8) * 255
 
         sess = data.get("session", {})
         seed_backend = sess.get("seed_backend")
@@ -1277,6 +1325,12 @@ class Handler(BaseHTTPRequestHandler):
 
         with app.lock:
             from PIL import Image
+            # Two files, deliberately. label_mask.png is the four-class truth;
+            # water_mask.png is the binary view every existing consumer already
+            # reads (export_dataset, training/data.read_mask, the scene list,
+            # every mask on disk from before the taxonomy). Writing both means
+            # adopting four classes breaks nothing downstream.
+            Image.fromarray(labels, "L").save(Path(scene["dir"]) / "label_mask.png", "PNG")
             Image.fromarray(final, "L").save(Path(scene["dir"]) / "water_mask.png", "PNG")
             # water_mask.png is whoever saved last; this per-annotator copy is
             # what makes inter-annotator agreement measurable at all. It lives
