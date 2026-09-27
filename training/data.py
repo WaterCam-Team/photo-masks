@@ -68,6 +68,16 @@ def read_mask(path: Path) -> np.ndarray:
     coarse for the rest. Re-label a scene to teach the model the difference.
     """
     import cv2
+    path = Path(path)
+    # The annotator writes both files: label_mask.png is the four-class truth,
+    # water_mask.png the binary view kept for consumers that predate the
+    # taxonomy. Manifests point at the latter because that is what gold
+    # selection gates on, so prefer its richer sibling when the scene has one.
+    # A binary model is unaffected — classes.collapse() folds the extra classes
+    # back into background.
+    sibling = path.parent / "label_mask.png"
+    if path.name == "water_mask.png" and sibling.exists():
+        path = sibling
     m = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
     if m is None:
         raise FileNotFoundError(path)

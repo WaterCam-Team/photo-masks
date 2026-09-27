@@ -1,7 +1,10 @@
 "use strict";
 /* UFONet Water Annotator — single-page canvas labeler.
-   Full-res binary mask in a Uint8Array (0 / 255); painted / auto-seeded / cleaned,
-   saved as water_mask.png. Every save/reject POSTs a labeling-decision record. */
+   Full-res label mask in a Uint8Array holding CLASS INDICES (0 background,
+   1 water, 2 snow_ice, 3 wet_ground); painted / auto-seeded / cleaned, saved as
+   label_mask.png plus a binary water_mask.png for consumers that predate the
+   taxonomy. The vocabulary comes from the server (training/classes.py), never
+   hardcoded here. Every save/reject POSTs a labeling-decision record. */
 
 const $ = (s) => document.querySelector(s);
 
@@ -23,7 +26,8 @@ async function api(p, opt) {
   }
 }
 
-const WATER_RGB = [0, 200, 255];
+const WATER_RGB = [0, 200, 255];   // legacy single-class tint, kept as a fallback
+const BG_CLASS = 0;                // index painted by the eraser
 const IDLE_MS = 12000;          // activity older than this doesn't count as "active"
 const UNDO_CAP = 30;
 const PENDING_MIN_MS = 320;      // minimum on-screen life of the SAM2 click ring
@@ -38,8 +42,12 @@ const S = {
   scenes: [],
   scene: null,                  // {id,name,size:[H,W], existing_masks}
   W: 0, H: 0,
-  mask: null,                   // Uint8Array(W*H)  0/255
+  mask: null,                   // Uint8Array(W*H) of class indices
   maskImage: null,              // ImageData for #mask
+  classes: [],                  // [{index,name,rgb}] from /api/config
+  waterClass: 1,                // index the server calls water
+  cls: 1,                       // class the brush paints; water by default
+  classCounts: null,            // Int32Array(nClasses), maintained incrementally
   undo: [], redo: [],
   tool: "brush",
   brush: 24, tol: 14, zoom: 1,
@@ -59,7 +67,7 @@ const S = {
   nStrokes: 0, nUndos: 0,
   activeSeconds: 0, lastActivity: 0, timer: null,
   // --- render bookkeeping -------------------------------------------
-  waterCount: 0,                // set pixels in S.mask, maintained incrementally
+  waterCount: 0,                // pixels of the water class; mirrors classCounts
   dirty: null,                  // {x0,y0,x1,y1} awaiting repaint, null = clean
   rafPending: false,            // a repaint is already scheduled for this frame
   rectCache: null,              // #mask bounding rect, refreshed per stroke
@@ -93,6 +101,15 @@ async function loadConfig() {
   const dev = S.cfg.device || "cpu";                    // e.g. "cuda (Radeon … · ROCm 6.2)"
   const devShort = dev.split(" ")[0];
   const accel = devShort.startsWith("cuda") || devShort === "xpu";
+  // The taxonomy is the server's, from training/classes.py. An older server
+  // that does not send one leaves the UI in its previous binary behaviour
+  // rather than inventing class names the backend would reject.
+  S.classes = S.cfg.classes || [{ index: 0, name: "background", rgb: [40, 40, 40] },
+                                { index: 1, name: "water", rgb: WATER_RGB }];
+  S.waterClass = S.cfg.water_class ?? 1;
+  S.cls = S.waterClass;
+  S._lut = null;
+  buildClassPicker();
   initAnnotatorName(S.cfg.annotator);
   $("#who").textContent = "config: " + cfgName + "  ·  " + devShort;
   if (S.cfg.device_hint && !S._hintShown) { S._hintShown = 1; toast(S.cfg.device_hint, "bad"); }
@@ -139,6 +156,36 @@ function initAnnotatorName(serverDefault) {
     markNameState();
   };
   markNameState();
+}
+
+/** Class picker: one button per non-background class plus the eraser.
+    Number keys 1..n select, matching the index the mask actually stores, so
+    the shortcut and the stored label can never drift apart. */
+function buildClassPicker() {
+  const host = $("#class-picker");
+  if (!host) return;
+  host.innerHTML = "";
+  for (const c of S.classes) {
+    if (c.index === BG_CLASS) continue;
+    const b = document.createElement("button");
+    b.className = "cls-btn";
+    b.dataset.cls = c.index;
+    b.title = `${c.name}  (key ${c.index})`;
+    b.innerHTML = `<i style="background:rgb(${c.rgb.join(",")})"></i>${c.name}`;
+    b.onclick = () => selectClass(c.index);
+    host.appendChild(b);
+  }
+  selectClass(S.cls);
+}
+
+function selectClass(i) {
+  S.cls = i;
+  if (S.tool === "erase") setTool("brush");
+  for (const b of document.querySelectorAll(".cls-btn")) {
+    b.classList.toggle("on", Number(b.dataset.cls) === i);
+  }
+  const c = S.classes.find((x) => x.index === i);
+  if (c) $("#brush-dot")?.style.setProperty("background", `rgb(${c.rgb.join(",")})`);
 }
 
 function buildBackendSelect() {
@@ -245,6 +292,8 @@ async function loadScene(id) {
   S.votesUrl = null; S.showVotes = false; S.imgCache = {};
   dropTintCache();
   S.waterCount = 0; S.dirty = null; invalidateRect();
+  S.classCounts = new Int32Array(nClasses());
+  S.classCounts[BG_CLASS] = S.mask.length;
   S.click.ready = false; S.click.on = null;      // a new scene needs a new embedding
   S.click.seed = null; S.click.nClicks = 0;
   resetClickSession(false);
@@ -322,13 +371,16 @@ function flushRender() {
   if (!d || !S.maskImage) return;
   S.dirty = null;
   const data = S.maskImage.data;
-  const [wr, wg, wb] = WATER_RGB;
+  const lut = classLut();          // index -> [r,g,b]; background stays clear
   for (let y = d.y0; y <= d.y1; y++) {
     let i = y * S.W + d.x0;
     let j = i * 4;
     for (let x = d.x0; x <= d.x1; x++, i++, j += 4) {
-      if (S.mask[i]) { data[j] = wr; data[j + 1] = wg; data[j + 2] = wb; data[j + 3] = 255; }
-      else { data[j + 3] = 0; }
+      const c = S.mask[i];
+      if (c) {
+        const rgb = lut[c] || WATER_RGB;
+        data[j] = rgb[0]; data[j + 1] = rgb[1]; data[j + 2] = rgb[2]; data[j + 3] = 255;
+      } else { data[j + 3] = 0; }
     }
   }
   $("#mask").getContext("2d")
@@ -350,15 +402,44 @@ function renderMask() {
   flushRender();
 }
 
-function recountWater() {
-  let n = 0;
-  for (let i = 0; i < S.mask.length; i++) if (S.mask[i]) n++;
-  S.waterCount = n;
+/** index -> [r,g,b], built once per scene from the server's vocabulary. */
+function classLut() {
+  if (S._lut) return S._lut;
+  const n = Math.max(2, S.classes.length);
+  const lut = new Array(n).fill(WATER_RGB);
+  for (const c of S.classes) lut[c.index] = c.rgb;
+  S._lut = lut;
+  return lut;
 }
 
+function nClasses() { return Math.max(2, S.classes.length); }
+
+function recountWater() {
+  const counts = new Int32Array(nClasses());
+  for (let i = 0; i < S.mask.length; i++) counts[S.mask[i]]++;
+  S.classCounts = counts;
+  S.waterCount = counts[S.waterClass] || 0;
+}
+
+/** Water percentage stays the headline number — it is the thing the node
+    detects and the thing the RL reward is computed on. The other classes get a
+    chip each so an under-labelled one is visible without doing arithmetic. */
 function updateWaterPct() {
-  const pct = (100 * S.waterCount / S.mask.length).toFixed(1);
+  const total = S.mask.length;
+  const pct = (100 * S.waterCount / total).toFixed(1);
   $("#water-pct").textContent = pct + " %";
+  const el = $("#class-counts");
+  if (!el || !S.classCounts) return;
+  el.innerHTML = "";
+  for (const c of S.classes) {
+    if (c.index === BG_CLASS) continue;
+    const n = S.classCounts[c.index] || 0;
+    const chip = document.createElement("span");
+    chip.className = "cc" + (n ? "" : " empty");
+    chip.style.borderColor = `rgb(${c.rgb.join(",")})`;
+    chip.textContent = `${c.name} ${(100 * n / total).toFixed(1)}%`;
+    el.appendChild(chip);
+  }
 }
 
 /* The canvas rect is only read once per stroke rather than per pointermove;
@@ -485,8 +566,9 @@ function stamp(cx, cy, val) {
       if (dx * dx + dy * dy <= r2) {
         const i = y * S.W + x;
         if (S.mask[i] !== val) {
+          if (S.classCounts) { S.classCounts[S.mask[i]]--; S.classCounts[val]++; }
           S.mask[i] = val;
-          S.waterCount += val ? 1 : -1;
+          S.waterCount = S.classCounts ? S.classCounts[S.waterClass] : S.waterCount;
           S.strokeDirty = true;
         }
       }
@@ -534,7 +616,7 @@ async function floodFill(px) {
     if (seen[i]) continue;
     seen[i] = 1;
     if (Math.abs(g[i] - target) > tol) continue;
-    S.mask[i] = 255; count++;
+    S.mask[i] = S.cls; count++;
     const x = i % S.W, y = (i / S.W) | 0;
     if (x > 0) stack.push(i - 1);
     if (x < S.W - 1) stack.push(i + 1);
@@ -717,8 +799,12 @@ async function applyClickCandidate() {
   cx.drawImage(img, 0, 0, S.W, S.H);
   const data = cx.getImageData(0, 0, S.W, S.H).data;
   const base = S.click.base;
+  // A seed backend detects water and nothing else, so its output lands in the
+  // water class. Anything the human had already painted as snow_ice or
+  // wet_ground is left alone — `base` carries those indices through.
   for (let i = 0, j = 0; i < S.mask.length; i++, j += 4) {
-    S.mask[i] = (base[i] || data[j] > 127) ? 255 : 0;
+    if (data[j] > 127) S.mask[i] = S.waterClass;
+    else S.mask[i] = base[i] || BG_CLASS;
   }
   S.click.seed = S.mask.slice();          // SAM2's output, pre-correction
   S.seedBackend = "sam2:interactive";
@@ -821,16 +907,29 @@ function fillHoles(src) {
   return out;
 }
 
+/* Clean acts on ONE class — the selected one — and leaves the others exactly
+   where they are. morph() and fillHoles() are binary operators: given a
+   four-class mask directly they would read every non-zero index as "set" and
+   write 255 back, collapsing water, snow_ice and wet_ground into one blob.
+   So the selected class is extracted to a binary plane, cleaned, and merged
+   back over only the pixels that were background or that class. */
 function clean() {
   if (!S.scene) return;
   snapshot();
-  let m = S.mask;
-  m = morph(m, 0); m = morph(m, 1);      // open  (despeckle)
-  m = morph(m, 1); m = morph(m, 0);      // close (bridge gaps)
-  m = fillHoles(m);
-  S.mask = m;
+  const cls = S.cls;
+  let plane = new Uint8Array(S.mask.length);
+  for (let i = 0; i < S.mask.length; i++) plane[i] = S.mask[i] === cls ? 255 : 0;
+  plane = morph(plane, 0); plane = morph(plane, 1);   // open  (despeckle)
+  plane = morph(plane, 1); plane = morph(plane, 0);   // close (bridge gaps)
+  plane = fillHoles(plane);
+  for (let i = 0; i < S.mask.length; i++) {
+    const was = S.mask[i];
+    if (was !== cls && was !== BG_CLASS) continue;    // another class: untouched
+    S.mask[i] = plane[i] ? cls : BG_CLASS;
+  }
   renderMask();
-  toast("cleaned (open + close + fill holes)");
+  const name = (S.classes.find((c) => c.index === cls) || {}).name || "class";
+  toast(`cleaned ${name} (open + close + fill holes)`);
 }
 
 /* --------------------------------------------------------- auto-segment */
@@ -974,20 +1073,38 @@ async function loadImgToMask(url, asSeed, seedName, params) {
   cx.drawImage(img, 0, 0, S.W, S.H);
   const data = cx.getImageData(0, 0, S.W, S.H).data;
   snapshot();
-  for (let i = 0, j = 0; i < S.mask.length; i++, j += 4) S.mask[i] = data[j] > 127 ? 255 : 0;
+  // Two encodings arrive here. label_mask.png holds class indices (small
+  // values, 0..n-1). Everything else — every auto backend, every mask saved
+  // before the taxonomy — is binary 0/255 and means water. Deciding per file
+  // rather than per pixel: a scan for any value in 1..n-1 says "indexed",
+  // because a binary mask only ever contains 0 and 255.
+  const n = nClasses();
+  let indexed = false;
+  for (let j = 0; j < data.length; j += 4) {
+    const v = data[j];
+    if (v > 0 && v < n) { indexed = true; break; }
+  }
+  for (let i = 0, j = 0; i < S.mask.length; i++, j += 4) {
+    const v = data[j];
+    S.mask[i] = indexed ? (v < n ? v : BG_CLASS) : (v > 127 ? S.waterClass : BG_CLASS);
+  }
   if (asSeed) { S.seedBackend = seedName; S.backendParams = params || {}; }
   renderMask();
 }
 
 /* -------------------------------------------------------- save / reject */
-function maskToPngDataUrl(src) {
+function maskToPngDataUrl(src, binary) {
   const m = src || S.mask;
   const c = document.createElement("canvas");
   c.width = S.W; c.height = S.H;
   const cx = c.getContext("2d");
   const im = cx.createImageData(S.W, S.H);
+  // Class index into R, G and B at full alpha. Lossless through the canvas
+  // round trip (no premultiplication at alpha 255, and PNG is lossless), and
+  // the server reads one channel. `binary` is for the SAM2 seed copy, which
+  // the server compares as water.
   for (let i = 0, j = 0; i < m.length; i++, j += 4) {
-    const v = m[i] ? 255 : 0;
+    const v = binary ? (m[i] === S.waterClass ? 255 : 0) : m[i];
     im.data[j] = im.data[j + 1] = im.data[j + 2] = v; im.data[j + 3] = 255;
   }
   cx.putImageData(im, 0, 0);
@@ -1019,7 +1136,7 @@ async function save() {
     body: JSON.stringify({
       mask_png_b64: maskToPngDataUrl(),
       // only when SAM2 actually produced something this scene
-      seed_png_b64: S.click.seed ? maskToPngDataUrl(S.click.seed) : undefined,
+      seed_png_b64: S.click.seed ? maskToPngDataUrl(S.click.seed, true) : undefined,
       session: session(),
     }),
   });
@@ -1143,7 +1260,7 @@ function wireControls() {
     S.drawing = true; S.strokeDirty = false;
     snapshot();
     S.last = px;
-    stamp(px.x, px.y, S.tool === "erase" ? 0 : 255);
+    stamp(px.x, px.y, S.tool === "erase" ? BG_CLASS : S.cls);
     scheduleRender();
     mk.setPointerCapture(e.pointerId);
   });
@@ -1192,6 +1309,13 @@ function wireControls() {
     else if (k === "n" && S.tool === "click") newClickObject();
     else if (k === "u") undo();
     else if (k === "r") redo();
+    // Number keys select the class, and the key IS the stored index, so the
+    // shortcut and the label cannot drift apart. 0 is the eraser.
+    else if (/^[0-9]$/.test(k)) {
+      const i = Number(k);
+      if (i === BG_CLASS) setTool("erase");
+      else if (S.classes.some((c) => c.index === i)) selectClass(i);
+    }
     else if (k === "[") setBrush(S.brush - 4);
     else if (k === "]") setBrush(S.brush + 4);
     else if (e.key === "Enter") save();
