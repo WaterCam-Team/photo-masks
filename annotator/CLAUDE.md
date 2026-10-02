@@ -235,6 +235,27 @@ trainer. Per-backend override: `backends.<name>.device`.
    → `#mask` (3). Hover-previews and the disagreement map draw to `#preview`
    and must never write `S.mask` — previewing has to stay non-destructive.
    `#preview` has `pointer-events: none` so it can't swallow brush strokes.
+15. **Evaluation scenes are drawn from scratch and never train.**
+   `work/eval_sets.csv` (`set` = reward | test, `scene_dir`; reader
+   `export_dataset.load_eval_sets`, re-read when the file changes) marks them.
+   - For those scenes the payload lists no masks, the frontend disables every
+     auto control, and the server refuses autoseg / ensemble / click / maskfile
+     (403) and any seeded save (409).
+   - The export sends reward scenes to val and drops test scenes. The manifest
+     takes the split from the sidecar, keeps `empty` eval scenes, and keeps
+     every scene of a session that has an eval scene out of training
+     (sessions are atomic: a field visit is one burst of near-duplicates).
+   - A new auto-seed path added anywhere must be refused for eval scenes too,
+     or evaluation silently measures imitation of the seed.
+16. **`review_seconds`** (appended column) is active seconds from a batch
+   backend's seed appearing to the first edit, or to the save when accepted
+   untouched. It is the AUTO route's cost in the routing cost model. Every
+   edit path (stroke, fill, clean, clear) must call `markEdited()`. Click
+   sessions don't start the clock.
+17. **Queue order:** `App.queue_order()` lists reward, test, then
+   `work/pool_queue.csv` scenes, then everything else. The sidebar and
+   save-and-next share it, so the planned frames aren't buried among
+   thousands of archive scenes.
 
 ---
 

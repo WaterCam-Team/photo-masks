@@ -153,6 +153,38 @@ def resolve_mask_default(item: dict) -> Path | None:
 # --gold-only mode: label-log-driven, human-verified masks only
 # ---------------------------------------------------------------------------
 
+# Evaluation sets (routing/LABELING_PLAN.md). A sidecar next to label_log.csv,
+# one row per scene: scene_id, set, scene_dir, ... Scenes listed here are
+# labeled from scratch (the annotator hides every auto seed for them) and are
+# NEVER training data: `reward` scenes score the model, `test` scenes are held
+# out of everything. Matched on the resolved scene_dir, which is what the
+# annotator's scene id hashes, so the id and the path always agree.
+EVAL_SETS_NAME = "eval_sets.csv"
+EVAL_SETS = ("reward", "test")
+
+
+def load_eval_sets(log_path: Path | None) -> dict[str, str]:
+    """{resolved scene_dir: 'reward' | 'test'}; {} when there is no sidecar."""
+    if log_path is None:
+        return {}
+    f = Path(log_path).parent / EVAL_SETS_NAME
+    if not f.exists():
+        return {}
+    out = {}
+    with f.open(newline="") as fh:
+        for r in csv.DictReader(fh):
+            st = (r.get("set") or "").strip()
+            sd = (r.get("scene_dir") or "").strip()
+            if st not in EVAL_SETS or not sd:
+                raise ValueError(f"{f}: bad row {dict(r)} (set must be one of {EVAL_SETS}, "
+                                 f"scene_dir required)")
+            key = str(Path(sd).resolve())
+            if out.get(key, st) != st:
+                raise ValueError(f"{f}: {sd} is listed in both sets")
+            out[key] = st
+    return out
+
+
 def find_label_log(captures_root: Path | None) -> Path | None:
     cands = [
         HERE / "annotator" / "work" / "label_log.csv",
@@ -262,11 +294,21 @@ def main():
             sys.exit(1)
         log.info(f"Gold-only export — label log: {log_path}")
         items = collect_gold(load_label_log(log_path))
+        # Evaluation scenes never train: reward scenes go to val, test scenes
+        # leave the export entirely.
+        ev = load_eval_sets(log_path)
+        n_test = sum(ev.get(str(Path(it["scene_dir"]).resolve())) == "test" for it in items)
+        items = [it for it in items if ev.get(str(Path(it["scene_dir"]).resolve())) != "test"]
+        if n_test:
+            log.info(f"  {n_test} test-set scene(s) held out of the export ({EVAL_SETS_NAME})")
         if not items:
             log.error("No gold (human-verified) scenes in the label log.")
             sys.exit(1)
         n_rep = 0
         for it in items:
+            if ev.get(str(Path(it["scene_dir"]).resolve())) == "reward":
+                it["_split"] = "val"
+                continue
             replicated = int(it.get("n_annotators", 1) or 1) > 1
             if replicated and not args.replicates_in_train:
                 it["_split"] = "val"

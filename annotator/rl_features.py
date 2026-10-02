@@ -36,7 +36,20 @@ LOG_HEADER = [
     "mask_path",       # this annotator's own copy of the mask, kept for
                        # inter-annotator agreement — water_mask.png in the scene
                        # dir is overwritten by whoever saves last
+    "seg_model",       # which SegFormer checkpoint produced seg_mean_entropy /
+                       # seg_low_conf_frac; both are meaningless without it,
+                       # since the same scene scores differently per model
+    "review_seconds",  # active seconds from an auto seed appearing to the first
+                       # edit or the save: what accepting (or rejecting) AUTO
+                       # costs, separate from correcting it. Empty when unseeded
+    "eval_set",        # reward | test when the scene is in work/eval_sets.csv
 ]
+
+# Rows whose *timing* is not a measurement, kept out of cost calibration and
+# the RL environment's cost data. Their masks remain gold (collect_gold never
+# reads this file). The log itself is append-only, so exclusions live here.
+EXCLUSIONS_NAME = "log_exclusions.csv"
+EXCLUSIONS_HEADER = ["scene_id", "timestamp", "scope", "reason", "decided"]
 
 
 # ---------------------------------------------------------------------------
@@ -123,15 +136,66 @@ def scene_features(tiff_path: Path) -> dict:
 # log writer
 # ---------------------------------------------------------------------------
 
+def _migrate_header(log_path: Path) -> None:
+    """Extend a log written under an older, shorter LOG_HEADER.
+
+    Columns are only ever appended (invariant 6), so an old header is a strict
+    prefix of the current one. Rows written since the header went stale
+    already carry the extra fields; without rewriting the header line
+    csv.DictReader files them under the key None and every reader silently
+    loses them. Only the first line changes; rows are untouched.
+    """
+    with log_path.open(newline="") as fh:
+        header = next(csv.reader(fh), None)
+        if header is None or header == LOG_HEADER:
+            return
+        if header != LOG_HEADER[:len(header)]:
+            raise ValueError(f"{log_path}: header is not a prefix of LOG_HEADER; "
+                             "refusing to append to a log with reordered columns")
+        fh.seek(0)
+        fh.readline()
+        rest = fh.read()
+    tmp = log_path.with_suffix(".csv.tmp")
+    with tmp.open("w", newline="") as out:
+        csv.writer(out).writerow(LOG_HEADER)
+        out.write(rest)
+    tmp.replace(log_path)
+
+
 def append_log(log_path: Path, row: dict) -> None:
     log_path = Path(log_path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     is_new = not log_path.exists()
+    if not is_new:
+        _migrate_header(log_path)
     with log_path.open("a", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=LOG_HEADER, extrasaction="ignore")
         if is_new:
             w.writeheader()
         w.writerow(row)
+
+
+def load_exclusions(log_path: Path, scope: str = "timing") -> set[tuple[str, str]]:
+    """(scene_id, timestamp) pairs excluded for `scope`, from the sidecar file."""
+    ex = Path(log_path).parent / EXCLUSIONS_NAME
+    if not ex.exists():
+        return set()
+    with ex.open(newline="") as fh:
+        return {(r["scene_id"], r["timestamp"]) for r in csv.DictReader(fh)
+                if r.get("scope") == scope}
+
+
+def timing_rows(log_path: Path) -> list[dict]:
+    """Log rows usable as cost measurements: everything not excluded for timing.
+
+    Use this, never a bare DictReader, for anything that reads active_seconds
+    as a cost (the cost model, the RL environment).
+    """
+    log_path = Path(log_path)
+    drop = load_exclusions(log_path, "timing")
+    with log_path.open(newline="") as fh:
+        return [r for r in csv.DictReader(fh)
+                if (r["scene_id"], r["timestamp"]) not in drop]
 
 
 def classify_route(seed_present: bool, n_strokes: int,
