@@ -157,6 +157,24 @@ def build(label_log: Path | None = None, val_split: float = 0.2,
                 report["missing"].append(r["scene_dir"])
 
     items = xd.collect_gold(log_rows)
+    ev = xd.load_eval_sets(Path(log_path))
+    if ev:
+        # An evaluation mask with no water is a real answer (the `empty`
+        # route), and collect_gold drops it as not-a-training-route. Evaluation
+        # sets need exactly those scenes, or IoU says nothing about false alarms.
+        have = {str(Path(it["scene_dir"]).resolve()) for it in items}
+        latest: dict[str, dict] = {}              # the latest decision per scene wins
+        for r in log_rows:
+            sd = (r.get("scene_dir") or "").strip()
+            if sd:
+                k = str(Path(sd).resolve())
+                if k not in latest or r.get("timestamp", "") >= latest[k].get("timestamp", ""):
+                    latest[k] = r
+        for it in xd.collect_gold([dict(r, route="manual_from_scratch")
+                                   for r in latest.values() if r.get("route") == "empty"]):
+            k = str(Path(it["scene_dir"]).resolve())
+            if k in ev and k not in have:
+                items.append(dict(it, route="empty"))
 
     # Assign once per group, then hand every scene its group's verdict, so a
     # session can never straddle the train/val boundary.
@@ -167,13 +185,29 @@ def build(label_log: Path | None = None, val_split: float = 0.2,
     verdict = {g: (assign_split(g, n, val_split, test_split), assign_fold(g, folds))
                for g, n in groups.items()}
 
+    # A session is atomic: once any of its scenes is an evaluation scene, none
+    # of the rest may be training data (field sessions are one short visit
+    # shot in bursts; its other frames are near-duplicates of the eval ones).
+    eval_groups = {group_of(it["scene_dir"], group_by) for it in items
+                   if ev.get(str(Path(it["scene_dir"]).resolve()))} if ev else set()
+    dropped = [it for it in items if not ev.get(str(Path(it["scene_dir"]).resolve()))
+               and group_of(it["scene_dir"], group_by) in eval_groups]
+    if dropped:
+        report["eval_session_leak"] = [it["scene_dir"] for it in dropped]
+        items = [it for it in items if it not in dropped]
+
     rows = []
     for it in items:
         stem = xd.scene_stem(it)
         g = group_of(it["scene_dir"], group_by)
         n = int(it.get("n_annotators") or 1)
+        # With evaluation sets, the split comes from the sidecar, never from
+        # the hash: reward -> val, test -> test, everything else is pool.
+        es = ev.get(str(Path(it["scene_dir"]).resolve())) if ev else None
+        split = ({"reward": "val", "test": "test"}[es] if es
+                 else ("train" if ev else verdict[g][0]))
         rows.append({
-            "split": verdict[g][0],
+            "split": split,
             "fold": verdict[g][1],
             "group": g,
             "stem": stem,
@@ -260,6 +294,12 @@ def main():
         if report[kind]:
             print(f"  WARNING {len(report[kind])} scene(s) {msg}: "
                   f"{', '.join(Path(p).name for p in report[kind][:4])}")
+    if report.get("eval_session_leak"):
+        leak = report["eval_session_leak"]
+        print(f"  WARNING {len(leak)} labeled scene(s) kept OUT of training: their session is "
+              f"used for evaluation (eval_sets.csv). Relabel them from scratch into the "
+              f"eval set or leave them unused: "
+              f"{', '.join(Path(p).parent.name + '/' + Path(p).name for p in leak[:4])}")
     write(rows, a.out)
     counts: dict[str, int] = {}
     routes: dict[str, int] = {}

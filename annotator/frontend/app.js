@@ -273,6 +273,14 @@ async function refreshScenes() {
     chip.className = "chip " + s.review_status;
     chip.textContent = s.review_status === "pending" ? "•" : s.review_status.slice(0, 4);
     li.append(nm, chip);
+    if (s.eval_set || s.pool_queue) {
+      const ev = document.createElement("span");
+      ev.className = "chip eval";
+      ev.title = s.eval_set ? `${s.eval_set}-set evaluation scene: from scratch`
+                            : "pool queue: run SAM2 first, then accept or correct (AUTO timing)";
+      ev.textContent = s.eval_set === "reward" ? "R" : s.eval_set === "test" ? "T" : "P";
+      li.append(ev);
+    }
     li.onclick = () => loadScene(s.id);
     ul.appendChild(li);
   }
@@ -303,6 +311,9 @@ async function loadScene(id) {
   $("#ens-votes").classList.remove("on");
   S.nStrokes = 0; S.nUndos = 0;
   S.activeSeconds = 0; S.lastActivity = Date.now();
+  S.seedShownAt = null; S.reviewSeconds = null;   // AUTO review clock, see markEdited()
+  S.evalSet = d.eval_set || null;
+  applyEvalMode();
 
   $("#placeholder").style.display = "none";
   const bg = $("#bg"), mk = $("#mask"), pv = $("#preview");
@@ -321,8 +332,9 @@ async function loadScene(id) {
   }
 
   await drawBackground();
-  // auto-load a previously saved manual mask if present
-  if (d.existing_masks.some((m) => m.name === "water_mask.png")) {
+  // auto-load a previously saved manual mask if present (never on an eval
+  // scene: the server lists no masks for those, and this is the second guard)
+  if (!S.evalSet && d.existing_masks.some((m) => m.name === "water_mask.png")) {
     await loadMaskFile("water_mask.png", /*asSeed=*/ false);
   }
   S.undo = []; S.redo = [];          // loading is not an edit
@@ -330,11 +342,35 @@ async function loadScene(id) {
   applyZoom();
   refreshScenes();
   $("#backend-status").textContent = "";
-  $("#decision-hint").textContent = "";
+  applyEvalMode();                    // sets or clears the evaluation banner
   // Click mode is sticky across scenes: the server keeps the SAM2 weights
   // loaded, so start encoding this scene now rather than making the labeller
   // re-select the tool and wait. After the saved-mask load, so it is the base.
-  if (S.tool === "click") enterClickMode();
+  if (S.tool === "click" && !S.evalSet) enterClickMode();
+}
+
+/* Evaluation scenes (work/eval_sets.csv) are drawn from scratch: every auto
+   seed is disabled here and refused by the server. A seeded evaluation mask
+   measures imitation of the seed, not correctness (LABELING_GUIDE.md). */
+function applyEvalMode() {
+  const on = !!S.evalSet;
+  for (const id of ["#sel-backend", "#btn-run", "#btn-ensemble", "#sel-existing", "#btn-load"])
+    $(id).disabled = on;
+  const ct = document.querySelector('.tool[data-tool="click"]');
+  if (ct) ct.disabled = on;
+  if (on && S.tool === "click") setTool("brush");
+  $("#decision-hint").textContent = on
+    ? `${S.evalSet}-set evaluation scene: draw it from scratch (auto seeds are off)` : "";
+}
+
+/* The AUTO route's cost is the time to look at an auto mask and decide. The
+   clock starts when a batch backend's mask appears (loadImgToMask, asSeed)
+   and stops at the first edit, or at save if the mask is accepted as is.
+   Interactive click sessions don't start it: the human is steering from the
+   first click, so there is no auto proposal to review. */
+function markEdited() {
+  if (S.seedShownAt != null && S.reviewSeconds == null)
+    S.reviewSeconds = S.activeSeconds - S.seedShownAt;
 }
 
 async function drawBackground() {
@@ -608,7 +644,7 @@ async function floodFill(px) {
   const i0 = px.y * S.W + px.x;
   if (i0 < 0 || i0 >= g.length) return;
   const target = g[i0], tol = S.tol;
-  snapshot();
+  snapshot(); markEdited();
   const stack = [i0], seen = new Uint8Array(g.length);
   let count = 0;
   while (stack.length) {
@@ -915,7 +951,7 @@ function fillHoles(src) {
    back over only the pixels that were background or that class. */
 function clean() {
   if (!S.scene) return;
-  snapshot();
+  snapshot(); markEdited();
   const cls = S.cls;
   let plane = new Uint8Array(S.mask.length);
   for (let i = 0; i < S.mask.length; i++) plane[i] = S.mask[i] === cls ? 255 : 0;
@@ -1088,7 +1124,10 @@ async function loadImgToMask(url, asSeed, seedName, params) {
     const v = data[j];
     S.mask[i] = indexed ? (v < n ? v : BG_CLASS) : (v > 127 ? S.waterClass : BG_CLASS);
   }
-  if (asSeed) { S.seedBackend = seedName; S.backendParams = params || {}; }
+  if (asSeed) {
+    S.seedBackend = seedName; S.backendParams = params || {};
+    if (S.seedShownAt == null) S.seedShownAt = S.activeSeconds;   // review clock starts
+  }
   renderMask();
 }
 
@@ -1120,6 +1159,8 @@ function session() {
     n_strokes: S.nStrokes,
     n_undos: S.nUndos,
     n_clicks: S.click.nClicks,
+    // accepted without an edit: review ends at the save
+    review_seconds: S.reviewSeconds ?? (S.seedShownAt != null ? S.activeSeconds - S.seedShownAt : ""),
     seg_mean_entropy: S.segMeta.mean_entropy ?? "",
     seg_low_conf_frac: S.segMeta.low_conf_frac ?? "",
     ensemble_agreement: S.ensemble.agreement ?? "",
@@ -1224,7 +1265,7 @@ function wireControls() {
   $("#btn-undo").onclick = undo;
   $("#btn-redo").onclick = redo;
   $("#btn-clean").onclick = clean;
-  $("#btn-clear").onclick = () => { if (S.scene) { snapshot(); S.mask.fill(0); renderMask(); } };
+  $("#btn-clear").onclick = () => { if (S.scene) { snapshot(); markEdited(); S.mask.fill(0); renderMask(); } };
   $("#btn-save").onclick = save;
   $("#btn-reject").onclick = reject;
   $("#btn-skip").onclick = async () => {
@@ -1290,7 +1331,7 @@ function wireControls() {
     scheduleRender();
   });
   const endStroke = () => {
-    if (S.drawing && S.strokeDirty) S.nStrokes++;
+    if (S.drawing && S.strokeDirty) { S.nStrokes++; markEdited(); }
     else if (S.drawing && !S.strokeDirty) S.undo.pop();   // no-op stroke: drop snapshot
     S.drawing = false; S.panning = false;
   };

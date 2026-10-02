@@ -63,6 +63,7 @@ if str(REPO_ROOT) not in sys.path:                # so `training` imports as a p
 # The label taxonomy is defined once, in training/classes.py, and read from
 # there rather than restated here or in the JavaScript. A second copy is a
 # second thing to forget to update.
+import export_dataset as xd                       # noqa: E402  (eval-set sidecar reader)
 from training.classes import (                    # noqa: E402
     CLASS_NAMES,
     IGNORE as IGNORE_LABEL,
@@ -634,6 +635,48 @@ class App:
         h = int(hashlib.sha1(f"replicate:{scene_id}".encode()).hexdigest(), 16)
         return (h % 100) < self.replicate_pct
 
+    def eval_set(self, scene: dict) -> str | None:
+        """'reward' | 'test' when the scene is in work/eval_sets.csv, else None.
+
+        Evaluation scenes are labeled from scratch: every auto seed (backends,
+        ensemble, click-to-segment, cached and on-disk masks) is withheld and
+        the endpoints refuse them, because a seeded evaluation mask measures
+        imitation of the seed, not correctness (LABELING_GUIDE.md). Re-read
+        when the file changes, so editing the list needs no restart.
+        """
+        f = self.work_dir / xd.EVAL_SETS_NAME
+        mt = f.stat().st_mtime if f.exists() else None
+        if getattr(self, "_eval_mtime", "unset") != mt:
+            self._eval = xd.load_eval_sets(self.log_path) if mt is not None else {}
+            self._eval_mtime = mt
+        return self._eval.get(str(Path(scene["dir"]).resolve()))
+
+    def pool_queued(self, scene: dict) -> bool:
+        """Is the scene in work/pool_queue.csv (the session's AUTO-timing frames)?"""
+        f = self.work_dir / "pool_queue.csv"
+        mt = f.stat().st_mtime if f.exists() else None
+        if getattr(self, "_pq_mtime", "unset") != mt:
+            q = set()
+            if mt is not None:
+                with f.open(newline="") as fh:
+                    for r in csv.DictReader(fh):
+                        if (r.get("scene_dir") or "").strip():
+                            q.add(str(Path(r["scene_dir"]).resolve()))
+            self._pq, self._pq_mtime = q, mt
+        return str(Path(scene["dir"]).resolve()) in self._pq
+
+    def queue_order(self) -> list[dict]:
+        """Scenes in labeling order: reward, test, pool queue, then the rest.
+
+        With the whole archive discovered (thousands of UFO007 frames), the
+        session's ~120 planned frames would otherwise be buried. Discovery
+        order is kept within each rank; the sidebar and save-and-next both use
+        this order.
+        """
+        rank = {"reward": 0, "test": 1}
+        return sorted(self.scenes, key=lambda s: rank.get(self.eval_set(s),
+                                                          2 if self.pool_queued(s) else 3))
+
     def blind_for(self, scene_id: str, annotator: str) -> bool:
         """Must this annotator be shown the scene without the existing mask?
 
@@ -680,6 +723,41 @@ class App:
         d = self.work_dir / "cache" / scene_id
         d.mkdir(parents=True, exist_ok=True)
         return d
+
+    def seg_uncertainty(self, scene: dict) -> dict:
+        """SegFormer's predictive uncertainty on this scene, whatever seeded it.
+
+        The routing policy's state needs it for every scene, but the client can
+        only report it when the human happened to seed from `segformer`, which
+        left both columns empty in every early row. So the server computes it
+        at save time with the currently served model, cached per scene and
+        per model (the value is meaningless without knowing which model).
+        Returns {} when no SegFormer is available: never blocks a save.
+        """
+        be = self.registry.get("segformer")
+        if be is None or not be.available()[0]:
+            return {}
+        mp = Path(be.model_path)
+        try:
+            model_id = str(mp.relative_to(self.work_dir))
+        except ValueError:
+            model_id = str(mp)
+        key = f"{model_id}@{int(mp.stat().st_mtime)}"
+        cf = self.cache_dir(scene["id"]) / "seg_uncertainty.json"
+        try:
+            cached = json.loads(cf.read_text())
+            if cached.get("key") == key:
+                return cached["values"]
+        except Exception:                             # noqa: BLE001 - recompute
+            pass
+        res = be.run(scene["dir"], scene["tiff"], {})
+        if res.error or "mean_entropy" not in res.meta:
+            return {}
+        values = {"seg_mean_entropy": res.meta["mean_entropy"],
+                  "seg_low_conf_frac": res.meta["low_conf_frac"],
+                  "seg_model": model_id}
+        cf.write_text(json.dumps({"key": key, "values": values}))
+        return values
 
     # -- persistence -------------------------------------------------------
     def _load_state(self) -> dict:
@@ -742,11 +820,12 @@ class App:
         leak that a mask already exists.
         """
         out = []
-        for s in self.scenes:
+        for s in self.queue_order():
             sid = s["id"]
             st = self.state.get(sid, {})
             done = self.labeled_by.get(sid, set())
-            blind = self.blind_for(sid, annotator)
+            ev = self.eval_set(s)
+            blind = self.blind_for(sid, annotator) or ev is not None
             out.append({
                 "id": sid, "name": s["name"],
                 "review_status": ("pending" if self.needs_label(sid, annotator)
@@ -756,6 +835,8 @@ class App:
                 "updated": st.get("updated"),
                 "has_manual": (not blind) and (Path(s["dir"]) / "water_mask.png").exists(),
                 "n_labels": len(done),
+                "eval_set": ev,
+                "pool_queue": self.pool_queued(s),
             })
         return out
 
@@ -812,6 +893,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def _png(self, img: np.ndarray) -> None:
         self._send(200, png_bytes(img), "image/png")
+
+    def _eval_refusal(self, scene: dict) -> None:
+        return self._err(403, f"{scene['name']} is a {self.app.eval_set(scene)}-set evaluation "
+                              f"scene: label it from scratch, no auto seed")
 
     def _err(self, code: int, msg: str) -> None:
         self._json({"ok": False, "error": msg}, code)
@@ -915,6 +1000,8 @@ class Handler(BaseHTTPRequestHandler):
             scene = app.by_id.get(m.group(1))
             if not scene:
                 return self._err(404, "no such scene")
+            if app.eval_set(scene) is not None:
+                return self._eval_refusal(scene)
             name = q.get("name", [""])[0]
             if not re.fullmatch(r"[A-Za-z0-9._-]+\.png", name or ""):
                 return self._err(400, "bad name")
@@ -945,6 +1032,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._err(404, "no such scene")
             who = clean_annotator(q.get("annotator", [""])[0], "")
             blind = app.blind_for(scene["id"], who)
+            ev = app.eval_set(scene)
             hw = list(_tiff_hw(scene["tiff"]))
             existing = [{"name": n, "label": lbl}
                         for n, lbl in EXISTING_MASKS
@@ -954,9 +1042,12 @@ class Handler(BaseHTTPRequestHandler):
             for f in sorted(app.cache_dir(scene["id"]).glob("_annotator_auto_*.png")):
                 existing.append({"name": f.name,
                                  "label": f"last {f.stem.replace('_annotator_auto_', '')}"})
+            if ev is not None:
+                existing = []                        # from scratch: no mask of any kind
             st = app.state.get(scene["id"], {})
             return self._json({
                 "id": scene["id"], "name": scene["name"], "size": hw,
+                "eval_set": ev,
                 "review_status": ("pending" if app.needs_label(scene["id"], who)
                                   else st.get("review_status", "pending")),
                 "existing_masks": existing,
@@ -976,6 +1067,8 @@ class Handler(BaseHTTPRequestHandler):
             scene = app.by_id.get(m.group(1))
             if not scene:
                 return self._err(404, "no such scene")
+            if app.eval_set(scene) is not None:
+                return self._eval_refusal(scene)
             data = self._body_json()
             bname = data.get("backend")
             backend = app.registry.get(bname)
@@ -1004,6 +1097,8 @@ class Handler(BaseHTTPRequestHandler):
             scene = app.by_id.get(m.group(1))
             if not scene:
                 return self._err(404, "no such scene")
+            if app.eval_set(scene) is not None:
+                return self._eval_refusal(scene)
             return self._handle_ensemble(scene, self._body_json())
 
         m = re.match(r"^/api/scene/([^/]+)/save$", p)
@@ -1018,6 +1113,8 @@ class Handler(BaseHTTPRequestHandler):
             scene = app.by_id.get(m.group(1))
             if not scene:
                 return self._err(404, "no such scene")
+            if app.eval_set(scene) is not None:
+                return self._eval_refusal(scene)
             return self._handle_click_prepare(scene, self._body_json())
 
         m = re.match(r"^/api/scene/([^/]+)/click$", p)
@@ -1025,6 +1122,8 @@ class Handler(BaseHTTPRequestHandler):
             scene = app.by_id.get(m.group(1))
             if not scene:
                 return self._err(404, "no such scene")
+            if app.eval_set(scene) is not None:
+                return self._eval_refusal(scene)
             return self._handle_click(scene, self._body_json())
 
         if p == "/api/click/release":
@@ -1290,6 +1389,10 @@ class Handler(BaseHTTPRequestHandler):
         sess = data.get("session", {})
         seed_backend = sess.get("seed_backend")
         seed = None
+        ev = app.eval_set(scene)
+        if ev is not None and (seed_backend or data.get("seed_png_b64")):
+            return self._err(409, f"{ev}-set scene saved with a seed ({seed_backend or 'click'}); "
+                                  f"evaluation masks must be drawn from scratch")
 
         # An interactive SAM2 session has no single auto-mask file to point at:
         # the result is the union of the candidates the human steered, composed
@@ -1322,6 +1425,7 @@ class Handler(BaseHTTPRequestHandler):
         auto_pct = round(100 * float((seed > 0).mean()), 3) if seed is not None else None
         route = rlf.classify_route(seed is not None, n_strokes, iou,
                                    (final > 0).any(), interactive)
+        unc = app.seg_uncertainty(scene)          # outside the lock: a forward pass
 
         with app.lock:
             from PIL import Image
@@ -1351,13 +1455,16 @@ class Handler(BaseHTTPRequestHandler):
                 "edited_pixel_frac": round(edited, 5) if edited is not None else "",
                 "active_seconds": round(active_s, 1),
                 "n_strokes": n_strokes, "n_undos": n_undos,
-                "seg_mean_entropy": sess.get("seg_mean_entropy", ""),
-                "seg_low_conf_frac": sess.get("seg_low_conf_frac", ""),
+                "seg_mean_entropy": unc.get("seg_mean_entropy", ""),
+                "seg_low_conf_frac": unc.get("seg_low_conf_frac", ""),
+                "seg_model": unc.get("seg_model", ""),
                 "ensemble_agreement": sess.get("ensemble_agreement", ""),
                 "ensemble_disagreement_frac": sess.get("ensemble_disagreement_frac", ""),
                 "n_backends_run": sess.get("n_backends_run", ""),
                 "features_json": json.dumps(feats),
                 "n_clicks": int(sess.get("n_clicks", 0) or 0),
+                "review_seconds": sess.get("review_seconds", ""),
+                "eval_set": ev or "",
                 "mask_path": str(per_mask),
             })
             app.state[scene["id"]] = {
@@ -1387,6 +1494,7 @@ class Handler(BaseHTTPRequestHandler):
         who = clean_annotator(sess.get("annotator"), app.annotator)
 
         if status == "rejected":
+            unc = app.seg_uncertainty(scene)
             with app.lock:
                 feats = app.features(scene)
                 rlf.append_log(app.log_path, {
@@ -1401,8 +1509,11 @@ class Handler(BaseHTTPRequestHandler):
                     "active_seconds": round(float(sess.get("active_seconds", 0)), 1),
                     "n_strokes": int(sess.get("n_strokes", 0)),
                     "n_undos": int(sess.get("n_undos", 0)),
-                    "seg_mean_entropy": sess.get("seg_mean_entropy", ""),
-                    "seg_low_conf_frac": sess.get("seg_low_conf_frac", ""),
+                    "seg_mean_entropy": unc.get("seg_mean_entropy", ""),
+                    "seg_low_conf_frac": unc.get("seg_low_conf_frac", ""),
+                    "seg_model": unc.get("seg_model", ""),
+                    "review_seconds": sess.get("review_seconds", ""),
+                    "eval_set": app.eval_set(scene) or "",
                     "features_json": json.dumps(feats),
                 })
                 app.state[scene["id"]] = {
@@ -1417,7 +1528,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _next_scene_id(self, current: str, annotator: str = "") -> str | None:
         """Next scene *this* annotator still owes a decision on."""
-        ids = [s["id"] for s in self.app.scenes]
+        ids = [s["id"] for s in self.app.queue_order()]
         try:
             start = ids.index(current)
         except ValueError:
