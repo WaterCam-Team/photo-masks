@@ -32,3 +32,10 @@ water_mask_preview.jpg
 _annotator_*.png
 manifest.csv
 dataset_provenance.csv
+
+# Routing (RL labelling) work kept local: run outputs (checkpoints, auto masks
+# of field scenes, logs), the site-specific labeling plan, and the session plan
+# select_frames.py reads (see routing/sessions.example.json).
+routing/results/
+routing/LABELING_PLAN.md
+routing/sessions.local.json

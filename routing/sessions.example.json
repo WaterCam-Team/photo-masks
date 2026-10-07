@@ -1,0 +1,37 @@
+{
+  "data_root": "/path/to/captures",
+  "plan": [
+    [
+      "reward",
+      "Collected Data/<session A>",
+      5
+    ],
+    [
+      "reward",
+      "UFO00N",
+      5
+    ],
+    [
+      "test",
+      "UFO2/<session B>",
+      5
+    ],
+    [
+      "pool",
+      "UFO2/<session C>",
+      10
+    ]
+  ],
+  "node_series": [
+    "UFO00N"
+  ],
+  "deploy": {
+    "UFO00N": [
+      [
+        "placement-1",
+        "20260101",
+        "20260131"
+      ]
+    ]
+  }
+}
