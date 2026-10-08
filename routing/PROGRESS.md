@@ -39,6 +39,18 @@ the labeling plan (`LABELING_PLAN.md`, kept locally). This file records what hap
 
 ---
 
+## 2026-10-08
+
+**Labelling started; fallback triggered.** Five frames were saved. The two Brooklyn
+Bridge Park reward frames (15:45 and 15:49) came out 100% background because of the
+drag-stroke bug, fixed in `c296eeb` at 16:09. They must be redone, and the redo rows'
+timing excluded, keeping the first attempts' 440 s and 238 s. The three later frames are
+correct. Median active time is about 7 min a frame, over the proposal's 3-minute rule, so
+`eval_sets.csv` was trimmed to **30 R / 20 T**: 11 relabels, all of Summer 2025 and every
+labelled frame kept, 4 frames per UFO007 placement. The backup is
+`eval_sets.csv.bak-20261008`. The one P frame labelled so far was drawn from scratch, so
+it has no `review_seconds`; the remaining P frames must use SAM2 Run.
+
 ## 2026-10-01
 
 **Queue MDP code built** on the 46 existing gold scenes (README): `queue_features.py`,
