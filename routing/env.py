@@ -16,10 +16,9 @@ reliably as it agrees with itself) and scored on the fixed val set:
     r_t = alpha * (mIoU_t - mIoU_{t-1}) - lam * minutes_t
 
 so the return telescopes to alpha * (final - initial mIoU) - lam * total
-minutes. The proposal defines an episode as one batch; here a batch is a step
-and the campaign is the episode, because a batch's value depends on what is
+minutes. A batch is a step and the campaign is the episode, because a batch's value depends on what is
 already labeled, and that sequential dependence is the whole reason for RL
-rather than a bandit. With `steps=1` it reduces to the proposal's form.
+rather than a bandit. With `steps=1` it reduces to a one-batch episode.
 
 The episode is a simulation over already-labeled scenes: every scene has a gold
 mask, and "MANUAL" reveals it. Episodes resample one small labeled set, so they
@@ -59,8 +58,8 @@ class CostModel:
     timing-valid row for it (all current ones are interactive_clicks, which is
     how the gold masks were really made), else the median of those. `auto_s`
     is NOT measured yet: no timing-valid auto rows exist, so it is a
-    placeholder until the planned labeling session calibrates it
-    (Objective 1). Keep that in anything reported from this env.
+    placeholder until the planned labeling session calibrates it.
+    Keep that in anything reported from this env.
     """
 
     manual_default_s: float

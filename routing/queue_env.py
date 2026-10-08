@@ -1,4 +1,4 @@
-"""The budgeted queue MDP (67-proposal-revised, "The MDP").
+"""The budgeted queue MDP.
 
     cost = CostModel.fit(data, train_keys)
     env = QueueEnv(data, pool_keys, QueueConfig(n=12, rho=0.25, review_s=c_s), cost)
@@ -22,11 +22,11 @@ training images only), plus budget left in median manual labels, images left
 (including this one), and budget per remaining image. The agent sees c_hat,
 never c, and never q, before deciding.
 
-Budget. The proposal sets B = rho * N * c_bar ("enough time to hand-label a
-quarter or half of the queue"). That only holds when reviews are free: with
-c_s > 0 the reviews of the other images come out of the same B. `budget =
-"review_inclusive"` adds them, B = rho*N*c_bar + (1 - rho)*N*c_s, so B again
-buys rho*N hand labels plus a review of every other image.
+Budget. `budget = "review_inclusive"` (the default) sets
+B = rho*N*c_bar + (1 - rho)*N*c_s, which buys rho*N hand labels plus a review of
+every other image. `budget = "labels_only"` sets B = rho * N * c_bar, which only
+buys rho*N hand labels when reviews are free: with c_s > 0 the reviews of the
+other images come out of the same B.
 
 `optimum()` is the hindsight ceiling: with every q and cost known, the best
 action sequence under the same budget rule, found exactly by enumerating all
@@ -47,7 +47,7 @@ ACTIONS = ("sam2", "manual")
 STATE_FEATURES = ("ripu", "entropy", "low_conf", "pred_water", "iou_seg_sam2",
                   "sam2_water", "manual_pred_min")
 BUDGET_FEATURES = ("budget_left", "images_left", "budget_per_image")
-# Regressors for c_hat (RL-project-next-steps, Phase 2): all label-free.
+# Regressors for c_hat: all label-free.
 COST_FEATURES = ("edge_density", "pred_water", "pred_components", "pred_boundary_frac")
 
 
@@ -61,7 +61,7 @@ class CostModel:
 
     Fitted only on the given (training) scenes that have a timing-valid log row.
     `mae()` reports the error on any other scenes with measured times, which is
-    the proposal's metric A for c_hat.
+    how well c_hat predicts labeling time on unseen images.
     """
 
     def __init__(self, coef: np.ndarray, n_fit: int, median_s: float):
@@ -101,14 +101,14 @@ class QueueConfig:
     rho: float = 0.25
     review_s: float = 0.0                 # c_s, seconds charged for a SAM2 step
     alpha: float = 100.0
-    budget: str = "proposal"              # "proposal" | "review_inclusive"
+    budget: str = "review_inclusive"      # "review_inclusive" | "labels_only"
 
 
 class QueueEnv:
     def __init__(self, data: dict, pool_keys: list[str], cfg: QueueConfig, cost: CostModel):
         if len(pool_keys) < cfg.n:
             raise ValueError(f"queue of {cfg.n} needs {cfg.n} scenes, pool has {len(pool_keys)}")
-        if cfg.budget not in ("proposal", "review_inclusive"):
+        if cfg.budget not in ("labels_only", "review_inclusive"):
             raise ValueError(f"unknown budget rule {cfg.budget!r}")
         self.cfg, self.data, self.cost = cfg, data, cost
         self.scenes = data["scenes"]

@@ -1,4 +1,4 @@
-"""Policies for the budgeted queue MDP (67-proposal-revised, "Policies compared").
+"""Policies for the budgeted queue MDP.
 
 Every policy is called as `policy(obs, rng) -> action` and must return an action
 in `obs["legal"]`. `fit(env, train_env, rng)` may set anything it needs from the
@@ -15,7 +15,7 @@ an evaluation scene.
                     remaining by RIPU, m = labels the budget left still buys
     sarsa           episodic semi-gradient Sarsa, linear in the standardized state
                     features plus a bias (S&B Sec. 10.1). The method
-    sarsa_x         ablation, not in the proposal: sarsa plus image-feature x
+    sarsa_x         ablation: sarsa plus image-feature x
                     budget-per-image products, so the value of a label can depend on
                     how scarce labels are
 """
@@ -102,11 +102,11 @@ class RIPUThreshold(Policy):
 
 class RIPURanked(Policy):
     """Not a causal queue policy: it sees every image still to come, as RIPU does
-    in the paper's own setting. Each step it works out m, how many hand labels the
+    in the RIPU paper's own setting. Each step it works out m, how many hand labels the
     budget left still buys after reviewing the rest with SAM2 (at the median
     manual time), and hand-labels this image if it is among the top m remaining
     by RIPU. When the reviews alone would exhaust the budget (possible under the
-    proposal's budget rule) m is 1 while any budget is left: it then labels an
+    labels_only budget rule) m is 1 while any budget is left: it then labels an
     image only if no later one scores higher."""
 
     name = "ripu_ranked"
@@ -135,7 +135,7 @@ class Sarsa(Policy):
     Rewards are learned in units of q (r / alpha). Epsilon-greedy over legal
     actions, epsilon decaying linearly from eps0 to eps1 over the training episodes.
     Every `curve_every` episodes the greedy policy is scored on fixed held-out
-    training queues (the proposal's learning curve, metric B1). Evaluation is greedy.
+    training queues (the learning curve). Evaluation is greedy.
     """
 
     def __init__(self, alpha: float, seed: int, episodes: int = 5000, eps0: float = 0.2,

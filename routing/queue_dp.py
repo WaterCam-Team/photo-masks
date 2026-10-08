@@ -1,4 +1,4 @@
-"""Hindsight optimum by dynamic programming over (t, b_t) (67-proposal-revised, policies).
+"""Hindsight optimum by dynamic programming over (t, b_t).
 
     V(t, b) = max over legal a of  alpha * q(x_t, a) + V(t + 1, b - cost(x_t, a)),
     V(N, b) = 0,  legal = {MANUAL, SAM2} if b > 0 else {SAM2}

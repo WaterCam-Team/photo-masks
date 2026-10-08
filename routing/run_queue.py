@@ -1,9 +1,9 @@
-"""Run every queue-MDP policy on identical queues and write the proposal's metrics.
+"""Run every queue-MDP policy on identical queues and write the evaluation metrics.
 
     python -m routing.run_queue --data results/<features>/queue_scenes.json \
         --out results/<name> [--review-s 5 --review-placeholder] [--rho 0.25 0.5]
 
-Protocol (67-proposal-revised, "Policies compared" and "Evaluation metrics"):
+Protocol:
 
 * Fit and evaluation scenes never overlap. `--eval-groups` names the evaluation
   sessions (the T set once it exists); without it, two session folds run on the
@@ -88,7 +88,7 @@ def main():
                     help="c_s in seconds; required while the label log has no review timings")
     ap.add_argument("--review-placeholder", action="store_true",
                     help="--review-s is not a measurement; say so in every output")
-    ap.add_argument("--budget", choices=["proposal", "review_inclusive"], default="proposal")
+    ap.add_argument("--budget", choices=["review_inclusive", "labels_only"], default="review_inclusive")
     ap.add_argument("--eval-groups", nargs="+", default=None)
     ap.add_argument("--split-group", default="Brooklyn Dec 2025")
     a = ap.parse_args()

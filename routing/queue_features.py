@@ -15,9 +15,9 @@ a feature computed by a model that saw the image's own mask would make the
 state look more informative than it can be in a real campaign.
 
 With `--train-groups` it instead trains **one** model on those sessions and
-computes features for every other scene: the proposal's protocol once the R / T
-frames exist ("trained once on the gold masks I already have, from sessions that
-supply no queue images").
+computes features for every other scene: the protocol for the real run once the
+R / T frames exist, with one model trained on the gold masks of sessions that
+supply no queue images.
 
 Writes:
     <out>/models/<session>.pt     fp16 weights per held-out session, or
@@ -115,7 +115,7 @@ def main():
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--train-groups", nargs="+", default=None,
-                    help="train one frozen model on these sessions (the proposal's protocol)")
+                    help="train one frozen model on these sessions")
     ap.add_argument("--label-log", type=Path, default=HERE / "annotator/work/label_log.csv",
                     help="read the median SAM2 review time c_s from here")
     a = ap.parse_args()

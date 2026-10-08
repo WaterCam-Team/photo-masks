@@ -1,4 +1,4 @@
-"""Objective 2's checks for the queue MDP (67-proposal-revised, Objectives; RL-project-next-steps, Phase 2).
+"""Checks for the queue MDP, its optimum and its baselines.
 
     annotator/.venv/bin/python -m routing.check_queue [--data results/<features>/queue_scenes.json]
 
@@ -62,7 +62,7 @@ def main():
     cost = CostModel.fit(data, keys)
     checks = []
 
-    for review_s, rule in itertools.product((0.0, 5.0), ("proposal", "review_inclusive")):
+    for review_s, rule in itertools.product((0.0, 5.0), ("labels_only", "review_inclusive")):
         for rho in (0.25, 0.5):
             env = QueueEnv(data, keys, QueueConfig(n=8, rho=rho, review_s=review_s, budget=rule), cost)
             bad = 0

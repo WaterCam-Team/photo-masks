@@ -6,12 +6,10 @@ Next labeling session (eval sets, AUTO timing): the labeling plan is kept locall
 session plan from a local `sessions.local.json`; see `sessions.example.json` for the format.
 Run outputs under `results/` (checkpoints, auto masks, logs) also stay local.
 
-**Scope reduced 2026-09-28, second cut** (document of record: `67-proposal-revised.pdf`
-in the RL course folder; the first cut is `67-proposal-revised-v1.pdf`). **No SegFormer
-retrain in the loop.** SegFormer-B0 is trained once, frozen, and only supplies features
+**Current design (since 2026-09-28): no SegFormer retrain in the loop.** SegFormer-B0 is trained once, frozen, and only supplies features
 and the image-level RIPU score. The new problem:
 - episode = queue of N=12 images with a budget B = rho*N*median manual seconds
-  (rho 0.25, 0.5); step = one image; actions {MANUAL, SAM2}, MANUAL only while budget > 0;
+  (rho 0.25, 0.5), plus review time for the rest; step = one image; actions {MANUAL, SAM2}, MANUAL only while budget > 0;
 - state = 7 label-free image features (RIPU, entropy, low-conf, pred water, IoU
   SegFormer-vs-SAM2, SAM2 water frac, predicted manual time) + budget left, images left,
   budget per remaining image;
@@ -23,12 +21,12 @@ and the image-level RIPU score. The new problem:
 `env.py`/`bandit.py` (retrain loop) are no longer on the project's critical path.
 The annotator is not changed.
 
-**Queue MDP built 2026-10-01, aligned with `67-proposal-revised` the same day.** It runs on
+**Queue MDP built 2026-10-01.** It runs on
 the 46 existing gold scenes until R and T are labelled:
 
 ```
 queue_features.py   frozen SegFormer-B0 (one per held-out session on the interim data;
-                    --train-groups for the proposal's single model), the state features
+                    --train-groups for one frozen model), the state features
                     incl. image-level RIPU, and the c_hat regressors -> queue_scenes.json
 queue_env.py        QueueEnv: budget B, MANUAL only while b > 0 (charged measured c(x)),
                     SAM2 charged c_s, reward 100 q; CostModel (c_hat, linear fit on
@@ -36,8 +34,8 @@ queue_env.py        QueueEnv: budget B, MANUAL only while b > 0 (charged measure
 queue_dp.py         the same optimum by DP over (t, b_t), in tenths of a second
 queue_policies.py   all_sam2, random, first_come, ripu_threshold (tau grid-tuned on
                     training queues), ripu_ranked, sarsa (S&B 10.1), sarsa_x (ablation)
-run_queue.py        100 paired eval queues per fold and budget, metrics A-C -> summary.md
-check_queue.py      Objective 2's checks (12/12 PASS)
+run_queue.py        100 paired eval queues per fold and budget, full metrics -> summary.md
+check_queue.py      environment and optimum checks (12/12 PASS)
 ```
 
 Run order: `python -m routing.queue_features ...`, then `python -m routing.check_queue`,
@@ -45,21 +43,21 @@ then `python -m routing.run_queue --data <dir>/queue_scenes.json --out <dir> --r
 --review-placeholder`. The last two flags stay until review timings exist; after that,
 c_s is read from the label log.
 
-Deliberate deviations from the proposal, all reported in `summary.md`:
-- **`sarsa_x` is an extra ablation.** The proposal's `sarsa` uses standardized features plus
+Design choices worth knowing, all reported in `summary.md`:
+- **`sarsa_x` is an extra ablation.** The main `sarsa` uses standardized features plus
   a bias only.
 - **The optimum is computed twice,** by subset enumeration and by DP, and the run stops if
   the two disagree.
 - **Interim folds are by session:** A fits on everything except `Brooklyn Dec 2025` and is
   scored on it, B the reverse. With T labelled, use `--eval-groups`.
 
-**Open design issue: the budget rule.** The proposal sets B = rho * N * c_bar and also
-charges c_s for every SAM2 step. With c_s > 0 the reviews spend the same budget, so B no
-longer buys rho * N hand labels. At c_s = 5 s, reviewing a whole queue of 12 (60 s) costs
-more than B at rho = 0.25 (48 s). `--budget review_inclusive` uses
-B = rho*N*c_bar + (1 - rho)*N*c_s instead. Pick one before the real run.
+**Budget rule.** Every SAM2 step is charged the review time c_s, so the budget includes
+it: B = rho*N*c_bar + (1 - rho)*N*c_s (`--budget review_inclusive`, the default). That
+buys rho*N hand labels plus a review of every other image. `--budget labels_only`
+(B = rho*N*c_bar) lets the reviews eat the hand-labeling time: at c_s = 5 s, reviewing
+a queue of 12 (60 s) costs more than all of B at rho = 0.25 (48 s).
 
-RIPU follows the paper's region-based definition: a 3x3 window, i.e. its k = 1, with
+RIPU follows the RIPU paper's (Xie et al. 2022) region-based definition: a 3x3 window, i.e. its k = 1, with
 uncertainty as the mean entropy in the window. The image score is the frame mean, which
 is ~0.39 x the predicted-boundary fraction.
 
@@ -97,8 +95,8 @@ bench_finetune.py        does a fast fine-tune rank batches like a full one? (it
   noisy evals on 11 val scenes is biased upward.
 - **Band statistics fixed per campaign** (`Campaign.stats`), so every retrain
   normalises identically.
-- **Episode = campaign, step = batch.** The proposal defined an episode as one
-  batch; that is `steps=1` here. A batch's value depends on what is already
+- **Episode = campaign, step = batch.** An episode of one batch is the special
+  case `steps=1`. A batch's value depends on what is already
   labeled, which is the reason for RL over a bandit.
 
 ## Cost model: what is and is not measured
@@ -106,7 +104,7 @@ bench_finetune.py        does a fast fine-tune rank batches like a full one? (it
 MANUAL = the scene's own `active_seconds` from a timing-valid log row
 (`rl_features.timing_rows()`, 34 scenes, all `interactive_clicks`), else their
 median. **AUTO = 5 s is a placeholder**; no timing-valid auto rows exist yet.
-Calibrating it is Objective 1 and needs the planned labeling session.
+Calibrating it needs the planned labeling session.
 
 ## Known properties of the environment
 

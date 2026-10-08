@@ -16,7 +16,7 @@ training and its mean when evaluating. The noise variance is set from the
 measured retrain spread, so the posterior knows a single step's reward is noisy.
 
 It is a bandit, not a full RL agent: each step is valued by its immediate
-gain. Whether lookahead (DQN) adds anything over this is the proposal's
+gain. Whether lookahead (DQN) adds anything over this is the
 bandit-vs-MDP question; this is the bandit rung.
 
     python -m routing.bandit --data data --out results/bandit \

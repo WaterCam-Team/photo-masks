@@ -21,7 +21,7 @@ After the batch is routed, SegFormer is retrained on everything labeled so far
 and scored on a fixed validation set. The agent wants the most segmentation
 accuracy for the fewest annotator minutes.
 
-This matches the three actions in the submitted proposal, `{Auto, Manual, Skip}`.
+These are three actions, `{Auto, Manual, Skip}`.
 The annotator tool's route vocabulary is finer than this. `interactive_clicks`
 (a person steering SAM2) is how every timed gold mask was actually made, so
 `MANUAL` stands for that route and is charged its measured time.
@@ -34,12 +34,11 @@ The annotator tool's route vocabulary is finer than this. `interactive_clicks`
 - **Horizon is finite and undiscounted** (gamma = 1). The episode ends after
   batch `T`.
 
-**This differs from the proposal.** The proposal called one batch an episode.
-Here the campaign is the episode, because a batch's value depends on what is
+**Why the campaign, not the batch, is the episode.** Here the campaign is the episode, because a batch's value depends on what is
 already labeled. For example, a third frame from a session already covered
 twice is worth less than the first frame from a new session. That dependence
-across batches is the reason to use RL at all. Setting `steps = 1` recovers the
-proposal's one-batch episode, which is then a contextual bandit.
+across batches is the reason to use RL at all. Setting `steps = 1` gives a
+one-batch episode, which is then a contextual bandit.
 
 `reset(seed)` draws a campaign from the 35-scene training pool: a random
 permutation gives `S0` (4 scenes) and then the `T` batches (16 scenes), 20
@@ -151,7 +150,7 @@ The return telescopes:
 so the agent is scored on the accuracy it added and the time it spent, not on
 how the gains were spread across steps.
 
-**The proposal's bad-accept penalty is implicit here.** An earlier draft
+**A bad-accept penalty is implicit here.** An earlier draft
 had an explicit term for accepting a bad auto mask: `-eta * u * (1 - Q)`, written
 eta, not gamma, since gamma is the discount. The environment has no such term,
 because its effect is measured directly. A bad auto mask in `L` lowers the
@@ -161,7 +160,7 @@ retrained model's validation mIoU, and the accuracy term charges it.
 mIoU) is about 2.3 reward units per step, while a hand-labeled scene costs
 about 0.27 units at `lam = 1`. At that setting annotator time barely registers
 next to accuracy noise. Choosing `lam`, that is, what a minute of annotator
-time is worth in mIoU, is Objective 1. Report results for more than one `lam`.
+time is worth in mIoU, is still open. Report results for more than one `lam`.
 
 ## 6. Known issues and placeholders
 
@@ -269,7 +268,7 @@ So the reward, as defined on 6 scenes from 2 sessions, measures fit to those 2
 sessions. A policy that maximizes it learns which pool scenes look like them.
 **The limit is the reward's validation set, not the policy class.** A stronger
 learner (DQN) on this reward would overfit it further. The fix is a larger and
-more session-diverse reward set, which is Objective 2's evaluation set
+more session-diverse reward set: the planned evaluation set
 (at least 25 masks; 11 exist).
 
 **Swapped-roles check (2026-09-28, `results/swap-*`)**, with reward = Summer 2025
@@ -305,7 +304,7 @@ test set the ordering at every `lam` is the same as above.
 It values each batch by its immediate gain only, with no lookahead to later
 batches. Its additive credit assignment also can't represent interactions
 within a batch, except through the batch-redundancy feature. It is the bandit
-rung of the proposal's bandit-versus-MDP question. A DQN over the same state,
+rung of the bandit-versus-MDP question. A DQN over the same state,
 valuing `L_t` for future batches, is the next rung. Whether it beats the
 bandit answers whether the sequential structure matters in practice.
 
