@@ -804,7 +804,7 @@ async function enterClickMode() {
   S.click.base = S.mask.slice();
   resetClickSession(true);
   const on = $("#sel-click-on").value;
-  if (S.click.ready && S.click.on === on) { clickStatus("ready — click the water"); return; }
+  if (S.click.ready && S.click.on === on) { clickStatus("ready — click the region to label"); return; }
   S.click.ready = false;
   S.click.busy = true;
   clickStatus(`preparing ${info.model || "SAM2"} for this scene… (one-off, ~20 s on CPU)`, true);
@@ -823,8 +823,8 @@ async function enterClickMode() {
   if (!r.ok) { setTool("brush"); clickStatus(""); return toast(r.error || "prepare failed", "bad"); }
   S.click.ready = true;
   S.click.on = on;
-  clickStatus(r.cached ? "ready — click the water"
-                       : `ready in ${r.elapsed_s}s — click the water`);
+  clickStatus(r.cached ? "ready — click the region to label"
+                       : `ready in ${r.elapsed_s}s — click the region to label`);
   bump();
 }
 
@@ -867,11 +867,16 @@ async function applyClickCandidate() {
   cx.drawImage(img, 0, 0, S.W, S.H);
   const data = cx.getImageData(0, 0, S.W, S.H).data;
   const base = S.click.base;
-  // A seed backend detects water and nothing else, so its output lands in the
-  // water class. Anything the human had already painted as snow_ice or
-  // wet_ground is left alone — `base` carries those indices through.
+  // The human is steering SAM2 at an object, so the object takes the label
+  // they selected: wet_ground clicked as wet_ground, not as water. (Batch
+  // backends are different: they only ever detect water, so Run seeds the
+  // water class; see loadImgToMask.) With background selected the object is
+  // painted as water, as it always was, so a click never silently erases.
+  // Pixels outside the object keep whatever was painted before: `base`
+  // carries those indices through.
+  const cls = S.cls === BG_CLASS ? S.waterClass : S.cls;
   for (let i = 0, j = 0; i < S.mask.length; i++, j += 4) {
-    if (data[j] > 127) S.mask[i] = S.waterClass;
+    if (data[j] > 127) S.mask[i] = cls;
     else S.mask[i] = base[i] || BG_CLASS;
   }
   S.click.seed = S.mask.slice();          // SAM2's output, pre-correction
@@ -888,7 +893,7 @@ function cycleClickCandidate() {
   S.click.idx = (S.click.idx + 1) % S.click.total;
   const c = S.click.cands[S.click.idx];
   applyClickCandidate().then(() => clickStatus(
-    `candidate ${S.click.idx + 1}/${S.click.total} · ${c.water_pct}% water (C to cycle)`));
+    `candidate ${S.click.idx + 1}/${S.click.total} · ${c.water_pct}% of frame (C to cycle)`));
 }
 
 function undoClickPoint() {
@@ -899,7 +904,7 @@ function undoClickPoint() {
     S.mask.set(S.click.base);
     renderMask();
     resetClickSession(true);
-    clickStatus("ready — click the water");
+    clickStatus("ready — click the region to label");
     return;
   }
   samClickRerun();
@@ -930,7 +935,7 @@ function newClickObject() {
   S.click.base = S.mask.slice();
   resetClickSession(true);
   restorePreview();
-  clickStatus("new object — click the water");
+  clickStatus("new object — click the region to label");
 }
 
 /* -------------------------------------------------- morphological clean */

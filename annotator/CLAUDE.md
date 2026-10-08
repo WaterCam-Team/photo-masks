@@ -266,6 +266,9 @@ trainer. Per-backend override: `backends.<name>.device`.
    - Shift+click with Fill (`relabelRegion`) changes one 4-connected region of
      the clicked label to the selected one. It follows the mask, not image
      brightness, so it cannot spill into another label.
+   - The Click (SAM2) tool paints its object in the selected label, or as water
+     when background is selected. Batch backends (Run) only detect water, so
+     their seed always lands in the water class.
 
 ---
 

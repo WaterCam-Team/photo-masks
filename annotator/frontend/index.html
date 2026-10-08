@@ -136,7 +136,7 @@
         <button data-tool="fill"  class="tool"
                 title="Click an area to fill everything of a similar brightness — good for a whole pond at once. Shift+click a painted region to change its label to the selected one (e.g. water painted on snow → snow_ice). Shortcut: F">Fill</button>
         <button data-tool="click" class="tool"
-                title="Click on the water and SAM2 outlines it. Left click = this is water, Shift/right click = this is not. Shortcut: K">Click (SAM2)</button>
+                title="Click a region and SAM2 outlines it in the selected label (water, snow_ice or wet_ground). Left click = include this, Shift/right click = exclude this. Shortcut: K">Click (SAM2)</button>
         <label title="Brush and eraser width. Shortcuts: [ smaller, ] larger">Size
           <input type="range" id="rng-brush" min="2" max="120" step="1" value="24"
                  aria-label="Brush size"></label>
@@ -144,7 +144,7 @@
           <input type="range" id="rng-tol" min="0" max="60" step="1" value="14"
                  aria-label="Fill tolerance"></label>
         <span id="click-group" hidden
-              title="SAM2 click-to-segment: left click the water, Shift or right click anything wrongly included.">
+              title="SAM2 click-to-segment: left click the region to label, Shift or right click anything wrongly included.">
           <label title="Which rendering SAM2 looks at. Changing it re-encodes the scene.">on
             <select id="sel-click-on" aria-label="Image SAM2 segments on">
               <option value="rgb">normal colour</option>
