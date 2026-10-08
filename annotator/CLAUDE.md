@@ -256,6 +256,16 @@ trainer. Per-backend override: `backends.<name>.device`.
    `work/pool_queue.csv` scenes, then everything else. The sidebar and
    save-and-next share it, so the planned frames aren't buried among
    thousands of archive scenes.
+18. **`S.mask` holds class indices, never 255.** Every path that writes it
+   (brush, drag strokes, fill, relabel) writes `S.cls` or `BG_CLASS`. A literal
+   255 is the binary era's "water". Today it renders as water but the server
+   saves it as background (`decode_label_png` maps any index >= n to 0), so it
+   fails silently. Drag strokes wrote 255 until 2026-10-08; no four-class mask
+   had been saved yet. 0/255 belongs only in temporary single-class planes
+   (`clean()`, `morph()`, `fillHoles()`) and in legacy files read on load.
+   - Shift+click with Fill (`relabelRegion`) changes one 4-connected region of
+     the clicked label to the selected one. It follows the mask, not image
+     brightness, so it cannot spill into another label.
 
 ---
 

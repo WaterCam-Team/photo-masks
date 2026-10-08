@@ -663,6 +663,38 @@ async function floodFill(px) {
   toast(`filled ${count.toLocaleString()} px (tol ${tol})`);
 }
 
+/* Shift+click with Fill: change the label of one painted region. From the
+   clicked pixel, every 4-connected pixel carrying the SAME label as it takes
+   the selected label. Unlike floodFill() this follows the mask, not the
+   image's brightness, so it can never spill into pixels of another label:
+   snow painted as water by mistake -> select snow_ice, shift+click it, done.
+   Clicking background relabels the whole connected background region, which
+   is what you want for an enclosed hole and too much anywhere else; it is one
+   undo either way, and the toast says how many pixels changed. */
+function relabelRegion(px) {
+  const i0 = px.y * S.W + px.x;
+  if (i0 < 0 || i0 >= S.mask.length) return;
+  const from = S.mask[i0], to = S.cls;
+  const name = (c) => (S.classes.find((k) => k.index === c) || {}).name || `class ${c}`;
+  if (from === to) { toast(`that region is already ${name(to)}`); return; }
+  snapshot(); markEdited();
+  // Writing `to` doubles as the visited mark, since from !== to.
+  const stack = [i0];
+  S.mask[i0] = to;
+  let count = 1;
+  while (stack.length) {
+    const i = stack.pop();
+    const x = i % S.W;
+    const nb = [x > 0 ? i - 1 : -1, x < S.W - 1 ? i + 1 : -1,
+                i >= S.W ? i - S.W : -1, i + S.W < S.mask.length ? i + S.W : -1];
+    for (const n of nb) {
+      if (n >= 0 && S.mask[n] === from) { S.mask[n] = to; count++; stack.push(n); }
+    }
+  }
+  renderMask();
+  toast(`relabeled ${count.toLocaleString()} px: ${name(from)} → ${name(to)}`);
+}
+
 /* ------------------------------------------------ click-to-segment (SAM2)
    Encoding a scene costs ~15-20 s on CPU; a click against the cached
    embedding costs ~70-150 ms. So selecting the tool pays the encode once,
@@ -1297,7 +1329,7 @@ function wireControls() {
     if (S.spaceHeld || e.button === 1) { S.panning = true; S.last = { x: e.clientX, y: e.clientY }; return; }
     const px = evToPx(e);
     if (S.tool === "click") { samClick(px, e.shiftKey || e.altKey || e.button === 2); return; }
-    if (S.tool === "fill") { floodFill(px); return; }
+    if (S.tool === "fill") { e.shiftKey ? relabelRegion(px) : floodFill(px); return; }
     S.drawing = true; S.strokeDirty = false;
     snapshot();
     S.last = px;
@@ -1321,7 +1353,7 @@ function wireControls() {
     bump();
     // Paint every coalesced sample so fast strokes stay continuous, but
     // repaint once per frame rather than once per event.
-    const val = S.tool === "erase" ? 0 : 255;
+    const val = S.tool === "erase" ? BG_CLASS : S.cls;
     const events = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
     for (const ev of (events.length ? events : [e])) {
       const px = evToPx(ev);
