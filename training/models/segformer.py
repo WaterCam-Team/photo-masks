@@ -96,7 +96,8 @@ class SegformerWrapper(SegModel):
 
     def export_onnx(self, onnx_out: Path, size: int = 512, opset: int = 17,
                     stats=None, embed_norm: bool = True,
-                    dynamic_hw: bool = True) -> Path:
+                    dynamic_hw: bool = True, model_name: str | None = None,
+                    model_version: str | None = None) -> Path:
         """Export for the camera nodes: dynamic H/W, dynamic batch, bilinear-upsampled.
 
         Opset 17, not 13: SegFormer attention in `transformers` 5.x lowers to
@@ -168,47 +169,44 @@ class SegformerWrapper(SegModel):
                           input_names=["input"], output_names=["logits"],
                           opset_version=opset, dynamo=False,
                           dynamic_axes={"input": dict(axes), "logits": dict(axes)})
-        self._stamp(onnx_out, stats, embed, dynamic_hw, size)
+        self._stamp(onnx_out, stats, embed, dynamic_hw, size, model_name, model_version)
         return onnx_out
 
     def _stamp(self, onnx_out: Path, stats, embed: bool,
-               dynamic_hw: bool = True, size: int = 512) -> None:
-        """Record in the graph what preprocessing it expects.
+               dynamic_hw: bool = True, size: int = 512,
+               model_name: str | None = None,
+               model_version: str | None = None) -> None:
+        """Record in the graph what preprocessing it expects (schema 1).
 
-        `onnxruntime` exposes these as
+        See `MODEL_METADATA.md`. `onnxruntime` exposes these as
         `session.get_modelmeta().custom_metadata_map`, so a deployment can read
-        them without the `onnx` package installed.
+        them without the `onnx` package installed. The `model.json` sidecar is
+        written by the caller once the file is final (it holds the sha256).
         """
-        import json as _json
+        from .. import modalities as _M
+        from ..model_metadata import build_metadata, stamp_onnx
 
-        import onnx
-
-        m = onnx.load(str(onnx_out))
-        meta = {
-            "arch": self.arch,
-            "in_channels": str(self.in_channels),
-            "num_classes": str(self.num_classes),
-            # Which index means what. Same comma-separated form as `bands`, so a
-            # runtime can read the taxonomy off the graph instead of assuming
-            # index 1 is water. Truncated to num_classes because a binary model
-            # exported from the four-class taxonomy really does only have two.
-            "classes": ",".join(_CLASS_NAMES[:self.num_classes]),
-            "input_layout": "NCHW",
-            "input_hw": "dynamic" if dynamic_hw else f"{size},{size}",
-            "trained_size": str(size),
-            "input_range": "raw_0_255" if embed else "normalised",
-            "normalization": ("embedded:" + stats.method) if embed
-            else ("external:" + (getattr(stats, "method", None) or "minmax")),
-        }
+        method = (getattr(stats, "method", None) or "minmax")
+        bands = list(stats.band_names) if stats is not None \
+            else list(_M.BAND_NAMES[:self.in_channels])
+        norm_stats = {}
+        if stats is not None and method == "meanstd":
+            norm_stats = {"norm_mean": stats.mean, "norm_std": stats.std}
+        elif stats is not None and method == "percentile":
+            norm_stats = {"norm_p_lo": stats.p_lo, "norm_p_hi": stats.p_hi}
+        props = build_metadata(
+            model_name=model_name or f"{self.arch}-{getattr(stats, 'modality', 'fiveband')}",
+            model_version=model_version, bands=bands,
+            # Truncated to num_classes because a binary model exported from the
+            # four-class taxonomy really does only have two.
+            classes=_CLASS_NAMES[:self.num_classes],
+            normalization=("embedded:" + method) if embed else method,
+            norm_stats=norm_stats,
+            input_hw="dynamic" if dynamic_hw else (size, size),
+            trained_size=(size, size),
+            # training/data.py and modalities.py resize with INTER_AREA
+            resize_interpolation="area", arch=self.arch)
         if stats is not None:
-            meta["modality"] = stats.modality
-            meta["bands"] = ",".join(stats.band_names)
-            meta["norm_mean"] = _json.dumps(stats.mean)
-            meta["norm_std"] = _json.dumps(stats.std)
-            meta["norm_p_lo"] = _json.dumps(stats.p_lo)
-            meta["norm_p_hi"] = _json.dumps(stats.p_hi)
-        del m.metadata_props[:]
-        for k, v in meta.items():
-            e = m.metadata_props.add()
-            e.key, e.value = k, str(v)
-        onnx.save(m, str(onnx_out))
+            props["modality"] = stats.modality
+        stamp_onnx(onnx_out, props)
+        self.metadata = props
