@@ -265,6 +265,14 @@ water** against 52.4% correct, silently. `--no-embed-norm` exports the legacy
 contract (pre-normalised input); the Pi then reads the statistics from the
 metadata instead.
 
+Every export also carries the schema-1 model metadata (bands, classes,
+normalization, sizes, resize interpolation, model name and version; see
+[MODEL_METADATA.md](MODEL_METADATA.md), identical to the one in
+`segformer_5band`) in `metadata_props`, and writes a `model.json` next to the
+`.onnx` with the same fields plus its sha256. The daemon refuses a model whose
+channels or normalization it cannot honour. INT8 calibration with no readable
+real scenes is an error, never random data.
+
 **The Train panel's "Export for deployment" builds the node bundle directly** —
 no second pass with a different script on the Pi:
 
@@ -273,6 +281,7 @@ segformer_5band_fp32.onnx    benchmark baseline          (15.1 MB)
 segformer_5band_int8.onnx    what the node runs           (4.6 MB)
 segformer_5band_prep.onnx    quantization intermediate
 deploy.json                  what these are, and the checks that were run
+model.json                   metadata + sha256 of the INT8 file (what the node runs)
 ```
 
 INT8 static quantization (per-channel, QDQ) is calibrated on your labelled

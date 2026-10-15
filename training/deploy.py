@@ -29,6 +29,7 @@ from pathlib import Path
 import numpy as np
 
 from . import modalities as M
+from . import model_metadata as MM
 from .classes import CLASS_NAMES as _CLASS_NAMES
 
 
@@ -64,6 +65,10 @@ def raw_input(tiff_path: Path, scene_dir: Path, modality: str, size: int) -> np.
     return r.astype(np.float32)[None]
 
 
+class CalibrationError(RuntimeError):
+    """INT8 calibration has no usable real data."""
+
+
 class _CalibrationReader:
     """Streams one calibration sample at a time; never holds the set in RAM."""
 
@@ -74,6 +79,7 @@ class _CalibrationReader:
         self.input_name = input_name
         self.size = size
         self.i = 0
+        self.used = 0                                 # scenes actually served
         self._emit = emit or (lambda **kw: None)
 
     def get_next(self):
@@ -81,9 +87,11 @@ class _CalibrationReader:
             r = self.rows[self.i]
             self.i += 1
             try:
-                return {self.input_name: raw_input(
+                x = raw_input(
                     r["tiff_path"], r.get("scene_dir") or Path(r["tiff_path"]).parent,
-                    self.modality, self.size)}
+                    self.modality, self.size)
+                self.used += 1
+                return {self.input_name: x}
             except Exception as e:                    # noqa: BLE001 - skip a bad scene
                 self._emit(event="warn", msg=f"calibration skipped {r.get('stem')}: {e}")
         return None
@@ -94,8 +102,14 @@ class _CalibrationReader:
 
 def build(hf_dir: Path, out_dir: Path, stats, calib_rows: list[dict],
           arch: str = "segformer-b0", size: int = 512, int8: bool = True,
-          emit=None, dynamic_hw: bool = True) -> dict:
-    """Export fp32 (+INT8) for the camera nodes and describe what was made."""
+          emit=None, dynamic_hw: bool = True, model_name: str | None = None,
+          model_version: str | None = None) -> dict:
+    """Export fp32 (+INT8) for the camera nodes and describe what was made.
+
+    Both graphs carry the schema-1 metadata (`MODEL_METADATA.md`) and
+    `model.json` describes the one the node runs (INT8 when built, else fp32)
+    with its sha256. INT8 needs real calibration scenes: with none, it raises.
+    """
     import onnxruntime as ort
 
     from . import models
@@ -106,16 +120,28 @@ def build(hf_dir: Path, out_dir: Path, stats, calib_rows: list[dict],
     fp32 = out_dir / FP32_NAME
     int8_path = out_dir / INT8_NAME
 
+    if int8 and not calib_rows:
+        # Checked up front: this used to warn and let the quantizer pick ranges
+        # from random data, which ships a model that loads, runs, and is wrong.
+        raise CalibrationError(
+            "INT8 needs real calibration scenes and none were given; refusing to "
+            "quantize on random data (pass scenes, or export fp32 only)")
+
+    model_name = model_name or Path(hf_dir).name
+    model_version = model_version or datetime.now().date().isoformat()
     m = models.load(arch, str(hf_dir), in_channels=stats.channels)
     t0 = time.time()
     m.export_onnx(fp32, size=size, stats=stats, embed_norm=True,
-                  dynamic_hw=dynamic_hw)
+                  dynamic_hw=dynamic_hw, model_name=model_name,
+                  model_version=model_version)
+    props = m.metadata
     emit(event="info", msg=f"fp32 graph -> {fp32.name} "
                            f"({fp32.stat().st_size / 1e6:.1f} MB, {time.time()-t0:.1f}s)")
 
     info = {
         "created": datetime.now().isoformat(timespec="seconds"),
         "arch": arch,
+        "model": {"name": model_name, "version": model_version},
         "modality": stats.modality,
         "bands": stats.band_names,
         "classes": list(_CLASS_NAMES[:_num_classes(hf_dir)]),
@@ -135,7 +161,7 @@ def build(hf_dir: Path, out_dir: Path, stats, calib_rows: list[dict],
 
     if not int8:
         info["int8"] = "skipped"
-        (out_dir / "deploy.json").write_text(json.dumps(info, indent=2))
+        _finish(info, props, fp32, out_dir)
         return info
 
     try:
@@ -144,7 +170,7 @@ def build(hf_dir: Path, out_dir: Path, stats, calib_rows: list[dict],
     except Exception as e:                            # noqa: BLE001
         emit(event="warn", msg=f"INT8 skipped — onnxruntime.quantization unavailable: {e}")
         info["int8"] = f"unavailable: {e}"
-        (out_dir / "deploy.json").write_text(json.dumps(info, indent=2))
+        _finish(info, props, fp32, out_dir)
         return info
 
     prep = out_dir / PREP_NAME
@@ -152,9 +178,6 @@ def build(hf_dir: Path, out_dir: Path, stats, calib_rows: list[dict],
     sess = ort.InferenceSession(str(prep), providers=["CPUExecutionProvider"])
     input_name = sess.get_inputs()[0].name
 
-    if not calib_rows:
-        emit(event="warn", msg="no calibration scenes — INT8 ranges will be guessed "
-                               "from random data and accuracy will suffer")
     reader = _CalibrationReader(calib_rows, stats.modality, input_name, size, emit)
 
     t0 = time.time()
@@ -170,6 +193,12 @@ def build(hf_dir: Path, out_dir: Path, stats, calib_rows: list[dict],
                     calibration_data_reader=reader, quant_format=QuantFormat.QDQ,
                     per_channel=True, activation_type=QuantType.QInt8,
                     weight_type=QuantType.QInt8, **kw)
+    if not reader.used:
+        raise CalibrationError(
+            f"none of the {len(calib_rows)} calibration scenes could be read; "
+            f"refusing to ship an INT8 model quantized on nothing")
+    # The quantizer does not reliably carry metadata_props over.
+    MM.stamp_onnx(int8_path, props)
     emit(event="info", msg=f"INT8 graph -> {int8_path.name} "
                            f"({int8_path.stat().st_size / 1e6:.1f} MB, "
                            f"{time.time()-t0:.0f}s, {len(calib_rows)} calibration scenes)")
@@ -183,8 +212,16 @@ def build(hf_dir: Path, out_dir: Path, stats, calib_rows: list[dict],
         info["accepts_node_shape"] = {
             k: _accepts_node_shape(v, stats.channels, emit)
             for k, v in (("fp32", fp32), ("int8", int8_path))}
-    (out_dir / "deploy.json").write_text(json.dumps(info, indent=2))
+    _finish(info, props, int8_path, out_dir)
     return info
+
+
+def _finish(info: dict, props: dict, onnx_path: Path, out_dir: Path) -> None:
+    """Write model.json (for the file the node runs) and deploy.json."""
+    MM.write_sidecar(onnx_path, props, out_dir / MM.SIDECAR_NAME)
+    info["files"]["model_json"] = MM.SIDECAR_NAME
+    info["sha256"] = MM.sha256_file(onnx_path)
+    (out_dir / "deploy.json").write_text(json.dumps(info, indent=2))
 
 
 #: What `SU-WaterCam/tools/segformer_daemon.py` actually feeds a dynamic graph:

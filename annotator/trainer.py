@@ -72,14 +72,20 @@ def export_pi(hf_dir: str, out_dir: str, img_size: int = 512, int8: bool = True,
         rows = mf.load(src, split="train")
     elif src.exists():                                  # an img_dir/ann_dir tree
         rows = D.legacy_rows(src).get("train", [])
-    if not rows:
-        emit(event="warn", msg=f"no calibration scenes under {src} — INT8 ranges "
-                               f"will come from whatever the quantizer guesses")
+    if int8 and not rows:
+        emit(event="error", msg=f"no calibration scenes under {src}: INT8 needs real "
+                                f"captures (pass --calib), or export fp32 only "
+                                f"with --no-int8")
+        sys.exit(1)
     rows = rows[:n_calib]
 
     arch = "segformer-b0"
-    info = deploy.build(hf, Path(out_dir), stats, rows, arch=arch,
-                        size=img_size, int8=int8, emit=emit)
+    try:
+        info = deploy.build(hf, Path(out_dir), stats, rows, arch=arch,
+                            size=img_size, int8=int8, emit=emit)
+    except deploy.CalibrationError as e:
+        emit(event="error", msg=str(e))
+        sys.exit(1)
     emit(event="deploy", **info)
 
 
@@ -106,7 +112,7 @@ def export_onnx(hf_dir: str, onnx_out: str, img_size: int = 512,
     stats = ST.BandStats.from_json(norm_src) if norm_src.exists() else None
     try:
         out = m.export_onnx(Path(onnx_out), size=img_size, stats=stats,
-                            embed_norm=not no_embed_norm)
+                            embed_norm=not no_embed_norm, model_name=hf.name)
     except Exception as e:                          # noqa: BLE001
         msg = str(e)
         low = msg.lower()
@@ -119,6 +125,9 @@ def export_onnx(hf_dir: str, onnx_out: str, img_size: int = 512,
         raise
     if norm_src.exists():
         shutil.copy(norm_src, out.parent / (out.stem + ".norm.json"))
+    # model.json holds the sha256, which the .onnx cannot contain itself
+    from training import model_metadata as MM
+    MM.write_sidecar(out, m.metadata, out.parent / MM.SIDECAR_NAME)
     emit(event="onnx", path=str(out), bytes=out.stat().st_size,
          norm=str(out.parent / (out.stem + ".norm.json")) if norm_src.exists() else None)
 
